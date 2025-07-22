@@ -1,3 +1,9 @@
+from scipy import sparse
+from sklearn.neighbors import NearestNeighbors
+from scipy.sparse.linalg import LinearOperator, cg
+from scipy.sparse import csr_matrix, eye
+import math
+from multiprocessing import Pool, cpu_count
 from collections import defaultdict
 from sklearn.preprocessing import StandardScaler
 from hmmlearn import hmm
@@ -14,6 +20,395 @@ from matplotlib import cm
 from matplotlib.colors import Normalize
 # Define the state_vector type for the state_vector
 dtype = np.float64
+
+
+def reconstruct_logs(history, dt):
+    """
+    history: (n_steps, p) array where
+      history[k,j] = (1/((k+1)*dt)) * sum_{m=0}^k ell_{m+1}^{(j)}
+    returns logs: (n_steps, p) array of ell_k^{(j)}
+    """
+    n_steps, p = history.shape
+    # build k and k-1 as column vectors
+    k = np.arange(1, n_steps+1)[:, None]      # shape (n_steps,1)
+    km1 = (k - 1)
+    # history shifted by one (with a zero‐row at the top)
+    hist_prev = np.vstack([np.zeros((1, p)), history[:-1]])
+    # vectorized inversion of h_k = (1/(k*dt)) sum ell  =>  ell_k = (k*h_k - (k-1)*h_{k-1})*dt
+    logs = (k*history - km1*hist_prev) * dt
+    return logs
+
+
+def compute_ftle_vectorized(logs, dt, window):
+    """
+    logs:   (n_steps, p) array of instantaneous log‐stretchings ell_k^{(j)}
+    window: integer N  (number of steps in the FTLE window)
+    returns:
+      ftles: (n_steps, p) array, where
+        ftles[k,j] = (1/(window*dt)) * sum_{m=k-window+1}^k logs[m,j],
+      with NaN for k<window-1
+    """
+    n_steps, p = logs.shape
+    # prefix‐sum of logs along time:
+    csum = np.vstack([np.zeros((1, p)), np.cumsum(logs, axis=0)])
+    # pairwise differences:  S[k] = csum[k] - csum[k-window]
+    # we want S at k=window...n_steps
+    S = csum[window:] - csum[:-window]   # shape = (n_steps-window+1, p)
+    # allocate output
+    ftles = np.empty_like(logs)
+    ftles[:window-1] = np.nan
+    ftles[window-1:] = S / (window * dt)
+    return ftles
+
+
+def density_normalized_laplacian(positions, f, k=20, epsilon=None):
+    """
+    Compute the density‐normalized graph Laplacian acting on f:
+        L f = (D_alpha - W_alpha) f / epsilon
+
+    where W_alpha is the Coifman‐Lafon (alpha=1) reweighted Gaussian kernel.
+
+    Parameters
+    ----------
+    positions : array, shape (n_samples, n_dims)
+        Sample points x_i in R^6.
+    f : array, shape (n_samples,)
+        Escape‐time field at each sample.
+    k : int, optional (default=20)
+        Number of nearest neighbors to use.
+    epsilon : float or None, optional
+        Kernel width. If None, set to mean squared distance to k-th neighbor.
+
+    Returns
+    -------
+    lap : ndarray, shape (n_samples,)
+        Approximation to Δ_M f at each sample (unnormalized by epsilon).
+    """
+    n = positions.shape[0]
+
+    # 1) k-NN search
+    nbrs = NearestNeighbors(n_neighbors=k+1, algorithm='auto', leaf_size=1000,
+                            n_jobs=-1).fit(positions)
+    dists, idxs = nbrs.kneighbors(positions)
+    dists = dists[:, 1:]      # drop self-distance
+    idxs = idxs[:, 1:]       # drop self-index
+
+    # 2) choose epsilon if not provided
+    if epsilon is None:
+        epsilon = np.mean(dists[:, -1]**2)
+
+    # 3) raw kernel weights: w_ij = exp(-d_ij^2/(4 ε))
+    weights = np.exp(- (dists**2) / (4 * epsilon))
+
+    # 4) build sparse raw W (both i->j and j->i for symmetry)
+    row = np.repeat(np.arange(n), k)
+    col = idxs.ravel()
+    data = weights.ravel()
+    W_raw = sparse.coo_matrix((data, (row, col)), shape=(n, n))
+    W_raw = (W_raw + W_raw.T)
+    W_raw.data *= 0.5   # ensure symmetry
+
+    # 5) compute degree for density correction
+    d_raw = np.array(W_raw.sum(axis=1)).ravel()  # shape (n,)
+
+    # 6) apply alpha=1 reweighting: W_ij <- W_raw_ij / (d_raw_i * d_raw_j)
+    #    we can do this efficiently by scaling rows & columns
+    inv_sqrt_d = 1.0 / np.sqrt(d_raw)
+    D_inv_sqrt = sparse.diags(inv_sqrt_d)
+    W_alpha = D_inv_sqrt @ (W_raw @ D_inv_sqrt)  # Efficient sparse mult
+
+    # 7) degree of the reweighted graph
+    d_alpha = np.array(W_alpha.sum(axis=1)).ravel()
+
+    # 8) compute (D_alpha - W_alpha) f
+    lap_unnorm = d_alpha * f - W_alpha.dot(f)
+
+    # 9) divide by epsilon to approximate Δ_M f
+    lap = lap_unnorm / epsilon
+
+    return lap
+
+
+def smooth_assignments_graph_laplacian(points, assignments, smoothing_param,
+                                       k_neighbors=10, method='knn'):
+    """
+    Smooth class assignments using graph Laplacian regularization.
+
+    Parameters:
+    -----------
+    points : ndarray, shape (n_obs, n_features)
+        Points in state space
+    assignments : ndarray, shape (n_obs,)
+        Integer class assignments
+    smoothing_param : float
+        Smoothing parameter (0 = no smoothing, larger = more smoothing)
+    k_neighbors : int, default=10
+        Number of neighbors for graph construction
+    method : str, default='knn'
+        Graph construction method ('knn' or 'epsilon')
+
+    Returns:
+    --------
+    smoothed_assignments : ndarray, shape (n_obs,)
+        Smoothed integer class assignments
+    """
+    n_obs = points.shape[0]
+    unique_classes = np.unique(assignments)
+    n_classes = len(unique_classes)
+
+    # Map assignments to consecutive integers starting from 0
+    class_mapping = {cls: idx for idx, cls in enumerate(unique_classes)}
+    mapped_assignments = np.array([class_mapping[cls] for cls in assignments])
+
+    # Build k-NN graph
+    if method == 'knn':
+        nbrs = NearestNeighbors(n_neighbors=k_neighbors+1,
+                                algorithm='auto').fit(points)
+        distances, indices = nbrs.kneighbors(points)
+
+        # Remove self-connections
+        distances = distances[:, 1:]
+        indices = indices[:, 1:]
+
+        # Build adjacency matrix with Gaussian weights
+        row_idx = np.repeat(np.arange(n_obs), k_neighbors)
+        col_idx = indices.flatten()
+
+        # Use adaptive bandwidth (median distance)
+        sigma = np.median(distances)
+        weights = np.exp(-distances.flatten()**2 / (2 * sigma**2))
+
+        adjacency = csr_matrix((weights, (row_idx, col_idx)),
+                               shape=(n_obs, n_obs))
+
+        # Symmetrize
+        adjacency = (adjacency + adjacency.T) / 2
+
+    # Compute graph Laplacian
+    degree = np.array(adjacency.sum(axis=1)).flatten()
+    degree_matrix = csr_matrix((degree, (np.arange(n_obs), np.arange(n_obs))),
+                               shape=(n_obs, n_obs))
+    laplacian = degree_matrix - adjacency
+
+    # Convert assignments to one-hot encoding
+    assignment_matrix = np.zeros((n_obs, n_classes))
+    assignment_matrix[np.arange(n_obs), mapped_assignments] = 1
+
+    # Solve regularized system: (I + λL)X = Y
+    identity = csr_matrix(eye(n_obs, format='csr'))
+    # system_matrix = identity + smoothing_param * laplacian
+
+    smoothed_probs = np.zeros((n_obs, n_classes))
+
+    def matvec(x):
+        # computes (I + λL) @ x without ever forming it explicitly
+        return x + smoothing_param * (degree * x - adjacency.dot(x))
+
+    A = LinearOperator((n_obs, n_obs), matvec=matvec)
+
+    for c in range(n_classes):
+        # then for each class:
+        smoothed_probs[:, c], info = cg(A, assignment_matrix[:, c], rtol=1e-6)
+        # smoothed_probs[:, c] = spsolve(system_matrix,
+        #                                assignment_matrix[:, c])
+
+    # Convert back to class assignments
+    smoothed_mapped_assignments = np.argmax(smoothed_probs, axis=1)
+
+    # Map back to original class labels
+    reverse_mapping = {idx: cls for cls, idx in class_mapping.items()}
+    smoothed_assignments = np.array([reverse_mapping[idx]
+                                     for idx in smoothed_mapped_assignments])
+
+    return smoothed_assignments
+
+
+def make_scatter_backgrounds(df, variable_pairs, color_var, categorical=False,
+                             cmap='viridis_r', norm=None, bins=(500, 500)):
+    """
+    For each (var1, var2) in variable_pairs, bin the points in 2D,
+    average their mapped colormap RGBA, and return a dict
+    { (var1,var2): {'img_array': HxWx4 array, 'extent': (xmin,xmax,ymin,ymax)} }.
+    """
+    backgrounds = {}
+    # If no norm given, set one over the full color_var range
+    all_vals = df[color_var].values
+    if norm is None:
+        norm = Normalize(all_vals.min(), all_vals.max())
+    cmap = cm.get_cmap(cmap)
+
+    if categorical:
+        # determine unique integer categories
+        cats = np.sort(df[color_var].unique())
+        n_cats = len(cats)
+
+        # turn your colormap into a discrete one with n_cats bins
+        cmap = plt.get_cmap(cmap, n_cats)
+
+        # build a norm that maps each integer to its own colour bin
+        # boundaries run from half-integer below the min to half-integer above the max
+        boundaries = np.concatenate(([cats[0] - 0.5], cats + 0.5))
+        norm = BoundaryNorm(boundaries, ncolors=n_cats)
+
+    for var1, var2 in variable_pairs:
+        x = df[var1].values
+        y = df[var2].values
+        v = df[color_var].values
+
+        # map values → RGBA
+        rgba_pts = cmap(norm(v))  # shape (N,4)
+
+        # define bin edges
+        xedges = np.linspace(x.min(), x.max(), bins[0] + 1)
+        yedges = np.linspace(y.min(), y.max(), bins[1] + 1)
+
+        # digitize positions to bin indices
+        xi = np.searchsorted(xedges, x, side='right') - 1
+        yi = np.searchsorted(yedges, y, side='right') - 1
+
+        H, W = bins[1], bins[0]
+        # accumulators
+        sum_rgba = np.zeros((H, W, 4), dtype=np.float64)
+        count = np.zeros((H, W),       dtype=np.int64)
+
+        # accumulate
+        for xx, yy, col in zip(xi, yi, rgba_pts):
+            if 0 <= xx < W and 0 <= yy < H:
+                sum_rgba[yy, xx] += col
+                count[yy, xx] += 1
+
+        # compute per‑pixel mean RGBA; leave empty pixels alpha=0
+        nonzero = count > 0
+        img = np.zeros((H, W, 4), dtype=np.float32)
+        img[nonzero] = (sum_rgba[nonzero] /
+                        count[nonzero][..., None])
+
+        # extent = (xmin, xmax, ymin, ymax)
+        extent = (xedges[0], xedges[-1], yedges[0], yedges[-1])
+
+        backgrounds[(var1, var2)] = {
+            'img_array': img,
+            'extent': extent
+        }
+
+    return backgrounds, cmap
+
+
+def save_single_frame(args):
+    """Create a frame with adaptive square subplots and a bottom plot with 1:4 aspect ratio."""
+    (t, df_columns, data, state_vector_t, output_folder, cmap,
+     variable_pairs, pc_state_t, X, Y) = args
+
+    num_pairs = len(variable_pairs)
+    cols = min(5, num_pairs)
+    rows = math.ceil(num_pairs / cols)
+
+    # Define subplot size
+    square_size = 3.0  # inches
+    fig_width = cols * square_size
+    fig_height_top = rows * square_size
+
+    # Bottom plot aspect ratio 1:4 (height = width / 4)
+    bottom_height = fig_width / 4.0
+    total_height = fig_height_top + bottom_height
+
+    # Create figure and GridSpec
+    fig = plt.figure(figsize=(fig_width, total_height))
+    height_ratios = [1] * rows + [bottom_height / square_size]
+    gs = fig.add_gridspec(rows + 1, cols, height_ratios=height_ratios)
+
+    # Create and fill top subplots
+    axes = [
+        fig.add_subplot(gs[i // cols, i % cols])
+        for i in range(num_pairs)
+    ]
+
+    for idx, (var1, var2) in enumerate(variable_pairs):
+        ax = axes[idx]
+        hist_data = data[(var1, var2)]
+
+        ax.imshow(hist_data["img_array"],
+                  extent=hist_data["extent"],
+                  cmap=cmap,
+                  aspect='equal',
+                  origin='lower')
+
+        var1_idx = df_columns.get_loc(var1)
+        var2_idx = df_columns.get_loc(var2)
+        scatter_x = pc_state_t[var1_idx] if pc_state_t is not None else state_vector_t[var1_idx]
+        scatter_y = pc_state_t[var2_idx] if pc_state_t is not None else state_vector_t[var2_idx]
+
+        ax.scatter(scatter_x, scatter_y,
+                   color='black' if pc_state_t is not None else 'red',
+                   s=20, alpha=0.7)
+
+        ax.set_xlabel(var1)
+        ax.set_ylabel(var2)
+
+        # Remove axis ticks
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    # Bottom combined plot
+    ax_beneath = fig.add_subplot(gs[rows, :])
+    mode = lin_comb(state_vector_t, X, Y)
+    plot_fourier_mode(mode, X, Y, ax_beneath)
+
+    # Remove ticks from bottom plot as well
+    ax_beneath.set_xticks([])
+    ax_beneath.set_yticks([])
+
+    # Save figure
+    frame_filename = os.path.join(output_folder, f"frame_{t:03d}.png")
+    plt.savefig(frame_filename, dpi=150)
+    plt.close(fig)
+
+    return f"Saved frame {t+1}: {frame_filename}"
+
+
+def save_time_step_plots_parallel(df, data, state_vector,
+                                  output_folder="frames",
+                                  n_steps=1000, cmap='viridis_r',
+                                  columns=None, n_processes=None,
+                                  pc_state=None):
+    """
+    Parallel version using multiprocessing.Pool
+    """
+    # Setup
+    os.makedirs(output_folder, exist_ok=True)
+
+    if columns is None:
+        x_columns = [col for col in df.columns
+                     if str(col).startswith(('x', 'PC'))]
+    else:
+        x_columns = columns
+
+    variable_pairs = list(combinations(x_columns, 2))
+
+    if n_processes is None:
+        n_processes = min(cpu_count(), n_steps)
+    x = np.linspace(0, 2 * np.pi, 500)
+    y = np.linspace(0, np.pi / 2, 500)
+    X, Y = np.meshgrid(x, y)
+    # Prepare arguments for each time step
+    args_list = []
+    for t in range(n_steps):
+        if pc_state is None:
+            args = (t, df.columns, data, state_vector[t, :],
+                    output_folder, cmap, variable_pairs, pc_state,
+                    X, Y)
+        else:
+            args = (t, df.columns, data, state_vector[t, :],
+                    output_folder, cmap, variable_pairs, pc_state[t, :],
+                    X, Y)
+        args_list.append(args)
+
+    # Process in parallel
+    with Pool(processes=n_processes) as pool:
+        results = pool.map(save_single_frame, args_list)
+
+    for result in results:
+        print(result)
 
 
 def load_d(filename, dims, sample_num):
@@ -359,173 +754,6 @@ def save_time_step_plots(df, histograms, stateVector, outputFolder="frames", bin
         print(f"Saved frame {t+1}/{n_steps}: {frameFilename}")
 
         from multiprocessing import Pool, cpu_count
-
-
-def save_single_frame(args):
-    """Process a single time step frame with an option to use histograms or scatter"""
-    (t, df_columns, data, state_vector_t, output_folder, cmap,
-     variable_pairs, pc_state_t, X, Y) = args
-
-    # Create figure for this time step
-    fig = plt.figure(figsize=(15, 12))
-    gs = fig.add_gridspec(4, 5, height_ratios=[3, 3, 3, 4])
-
-    # Create axes
-    axes = [fig.add_subplot(gs[row, col])
-            for row in range(3) for col in range(5)]
-
-    for idx, (var1, var2) in enumerate(variable_pairs):
-        if idx >= len(axes):
-            break
-
-        ax = axes[idx]
-
-        hist_data = data[(var1, var2)]
-        ax.imshow(hist_data["img_array"],
-                  extent=hist_data["extent"],
-                  cmap=cmap,
-                  aspect='auto', origin='lower')
-
-        var1_idx = df_columns.get_loc(var1)
-        var2_idx = df_columns.get_loc(var2)
-
-        if pc_state_t is None:
-            ax.scatter(
-                state_vector_t[var1_idx], state_vector_t[var2_idx],
-                color='red', s=20, alpha=0.7)
-        else:
-            ax.scatter(
-                pc_state_t[var1_idx], pc_state_t[var2_idx],
-                color='red', s=20, alpha=0.7)
-
-        ax.set_xlabel(var1)
-        ax.set_ylabel(var2)
-
-    # Additional plot
-    ax_beneath = fig.add_subplot(gs[3, :])
-    mode = lin_comb(state_vector_t, X, Y)
-    plotFourierMode(mode, X, Y, ax_beneath)
-
-    # Save frame
-    frame_filename = os.path.join(output_folder, f"frame_{t:03d}.png")
-    plt.savefig(frame_filename, dpi=150)
-    plt.close(fig)
-
-    return f"Saved frame {t+1}: {frame_filename}"
-
-
-def save_time_step_plots_parallel(df, data, state_vector,
-                                  output_folder="frames",
-                                  n_steps=1000, cmap='viridis_r',
-                                  columns=None, n_processes=None,
-                                  pc_state=None):
-    """
-    Parallel version using multiprocessing.Pool
-    """
-    # Setup
-    os.makedirs(output_folder, exist_ok=True)
-
-    if columns is None:
-        x_columns = [col for col in df.columns
-                     if str(col).startswith(('x', 'PC'))]
-    else:
-        x_columns = columns
-
-    variable_pairs = list(combinations(x_columns, 2))
-
-    if n_processes is None:
-        n_processes = min(cpu_count(), n_steps)
-
-    # Prepare arguments for each time step
-    args_list = []
-    for t in range(n_steps):
-        if pc_state is None:
-            args = (t, df.columns, data, state_vector[t, :],
-                    output_folder, cmap, variable_pairs, pc_state,
-                    X, Y)
-        else:
-            args = (t, df.columns, data, state_vector[t, :],
-                    output_folder, cmap, variable_pairs, pc_state[t, :],
-                    X, Y)
-        args_list.append(args)
-
-    # Process in parallel
-    with Pool(processes=n_processes) as pool:
-        results = pool.map(save_single_frame, args_list)
-
-    for result in results:
-        print(result)
-
-
-def make_scatter_backgrounds(df, variable_pairs, color_var, categorical=False,
-                             cmap='viridis_r', norm=None, bins=(500, 500)):
-    """
-    For each (var1, var2) in variable_pairs, bin the points in 2D,
-    average their mapped colormap RGBA, and return a dict
-    { (var1,var2): {'img_array': HxWx4 array, 'extent': (xmin,xmax,ymin,ymax)} }.
-    """
-    backgrounds = {}
-    # If no norm given, set one over the full color_var range
-    all_vals = df[color_var].values
-    if norm is None:
-        norm = Normalize(all_vals.min(), all_vals.max())
-    cmap = cm.get_cmap(cmap)
-
-    if categorical:
-        # determine unique integer categories
-        cats = np.sort(df[color_var].unique())
-        n_cats = len(cats)
-
-        # turn your colormap into a discrete one with n_cats bins
-        cmap = plt.get_cmap(cmap, n_cats)
-
-        # build a norm that maps each integer to its own colour bin
-        # boundaries run from half-integer below the min to half-integer above the max
-        boundaries = np.concatenate(([cats[0] - 0.5], cats + 0.5))
-        norm = BoundaryNorm(boundaries, ncolors=n_cats)
-
-    for var1, var2 in variable_pairs:
-        x = df[var1].values
-        y = df[var2].values
-        v = df[color_var].values
-
-        # map values → RGBA
-        rgba_pts = cmap(norm(v))  # shape (N,4)
-
-        # define bin edges
-        xedges = np.linspace(x.min(), x.max(), bins[0] + 1)
-        yedges = np.linspace(y.min(), y.max(), bins[1] + 1)
-
-        # digitize positions to bin indices
-        xi = np.searchsorted(xedges, x, side='right') - 1
-        yi = np.searchsorted(yedges, y, side='right') - 1
-
-        H, W = bins[1], bins[0]
-        # accumulators
-        sum_rgba = np.zeros((H, W, 4), dtype=np.float64)
-        count = np.zeros((H, W),       dtype=np.int64)
-
-        # accumulate
-        for xx, yy, col in zip(xi, yi, rgba_pts):
-            if 0 <= xx < W and 0 <= yy < H:
-                sum_rgba[yy, xx] += col
-                count[yy, xx] += 1
-
-        # compute per‑pixel mean RGBA; leave empty pixels alpha=0
-        nonzero = count > 0
-        img = np.zeros((H, W, 4), dtype=np.float32)
-        img[nonzero] = (sum_rgba[nonzero] /
-                        count[nonzero][..., None])
-
-        # extent = (xmin, xmax, ymin, ymax)
-        extent = (xedges[0], xedges[-1], yedges[0], yedges[-1])
-
-        backgrounds[(var1, var2)] = {
-            'img_array': img,
-            'extent': extent
-        }
-
-    return backgrounds, cmap
 
 
 def combine_binary_files(base_name, output_filename, dtype, dims,
@@ -959,51 +1187,6 @@ def analyze_regime_escape_times(states, dt=1.0):
     }
 
     return result
-
-
-def combine_binary_files(base_name, output_filename, dtype, dims,
-                         sample_num, file_count=99):
-    """
-    Combine multiple binary files into a single file preserving structure.
-
-    Args:
-        base_name: Base filename pattern (e.g., 'dataOro20_')
-        output_filename: Name of the combined output file
-        dtype: Data type for reading files
-        dims: Number of dimensions in each file
-        sample_num: Number of samples per file
-        file_count: Number of files to combine (default: 99)
-    """
-    missing_files = []
-    all_data = []
-
-    for file_idx in range(1, file_count + 1):
-        input_filename = f"{base_name}{file_idx}.bin"
-
-        if not os.path.exists(input_filename):
-            missing_files.append(input_filename)
-            continue
-
-        with open(input_filename, 'rb') as file:
-            file_data = np.fromfile(file, dtype=dtype).reshape(dims,
-                                                               sample_num).T
-            all_data.append(file_data)
-
-    if all_data:
-        combined_array = np.vstack(all_data)
-        # Save in same format: transpose and flatten
-        combined_binary = combined_array.T.flatten()
-        combined_binary.astype(dtype).tofile(output_filename)
-
-    if missing_files:
-        print(f"Warning: {len(missing_files)} files were missing:")
-        for missing_file in missing_files:
-            print(f"  - {missing_file}")
-
-    files_processed = file_count - len(missing_files)
-    total_samples = files_processed * sample_num
-    print(f"Combined {files_processed} files into {output_filename}")
-    print(f"New sample_num for combined file: {total_samples}")
 
 
 def escape_times(regimes):
