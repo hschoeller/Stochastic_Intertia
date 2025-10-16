@@ -1,3 +1,4 @@
+from scipy.sparse.linalg import spsolve
 from scipy import sparse
 from sklearn.neighbors import NearestNeighbors
 from scipy.sparse.linalg import LinearOperator, cg
@@ -801,6 +802,158 @@ def combine_binary_files(base_name, output_filename, dtype, dims,
     print(f"New sample_num for combined file: {total_samples}")
 
 
+def diffusion_maps_matrix(X, epsilon):
+    """
+    X: ndarray, shape (n_samples, n_features)
+    epsilon: float
+    returns: (DMM, A) as scipy.sparse matrices
+    """
+    n_samples = X.shape[0]
+    r = np.sqrt(5.0 * epsilon)
+
+    nbrs = NearestNeighbors(radius=r).fit(X)
+    distances_list, indices_list = nbrs.radius_neighbors(
+        X, return_distance=True)
+
+    # accumulate COO entries
+    total = sum(len(idx) for idx in indices_list)
+    rows = np.empty(total, dtype=np.int32)
+    cols = np.empty(total, dtype=np.int32)
+    vals = np.empty(total, dtype=np.float64)
+
+    p = 0
+    for i, (idxs, dists) in enumerate(zip(indices_list, distances_list)):
+        li = len(idxs)
+        if li == 0:
+            continue
+        rows[p:p+li] = i
+        cols[p:p+li] = idxs
+        vals[p:p+li] = dists
+        p += li
+
+    if p < total:
+        rows = rows[:p]
+        cols = cols[:p]
+        vals = vals[:p]
+
+    # Gaussian kernel (note: using epsilon in denominator like exp(-d^2/epsilon))
+    A = sparse.coo_matrix((np.exp(-(vals**2) / epsilon),
+                          (rows, cols)), shape=(n_samples, n_samples)).tocsr()
+
+    # ensure self-loop weight (set diagonal to 1.0)
+    A.setdiag(1.0)
+
+    # density normalization (Coifman–Lafon style with alpha = 1.0)
+    row_means = np.asarray(A.mean(axis=1)).ravel()
+    # avoid division by zero
+    row_means[row_means == 0] = np.finfo(float).eps
+    q = 1.0 / row_means
+
+    alpha = 1.0
+    kalpha = q ** alpha
+    D_k = sparse.diags(kalpha, offsets=0, format='csr')
+    Adensnorm = D_k.dot(A).dot(D_k)
+
+    # row-normalize to get Markov matrix DMM
+    row_sums = np.asarray(Adensnorm.sum(axis=1)).ravel()
+    row_sums[row_sums == 0] = np.finfo(float).eps
+    inv_row_sums = 1.0 / row_sums
+    D_norm = sparse.diags(inv_row_sums, offsets=0, format='csr')
+    DMM = D_norm.dot(Adensnorm)
+
+    return DMM, A
+
+
+def compute_clusters_from_TO(DMM, n_eig=12, n_clusters=2, n_init=10,
+                             eig_indices=None, random_state=0):
+    """
+    DMM: scipy.sparse matrix, shape (n_samples, n_samples)  -- diffusion-maps Markov matrix (row-stochastic)
+    n_eig: int -- number of eigenpairs to compute (ARPACK)
+    n_clusters: int -- k for k-means
+    n_init: int -- k-means n_init
+    eig_indices: None or list/array of zero-based eigenvector indices to use as features.
+                 If None, defaults to [1,2,3,4] (i.e. first nontrivial eigenvectors).
+    random_state: int
+    returns: dict with keys 'labels', 'kmeans', 'eigenvals', 'eigenvecs', 'features', 'L'
+    """
+    import numpy as np
+    from scipy.sparse.linalg import eigs
+    from sklearn.cluster import KMeans
+
+    n = DMM.shape[0]
+
+    # build time-shifted transfer operator (size (n-1, n-1))
+    L = DMM[1:, :-1].transpose()
+
+    k_eigs = max(1, min(n_eig, L.shape[0] - 1))
+
+    # try sparse eigen solver first, fallback to dense
+    try:
+        eigvals, eigvecs = eigs(L, k=k_eigs, which='LM')
+    except Exception:
+        L_dense = L.toarray() if hasattr(L, "toarray") else np.asarray(L)
+        eigvals_all, eigvecs_all = np.linalg.eig(L_dense)
+        idx_sort = np.argsort(-np.abs(eigvals_all))
+        take = min(k_eigs, len(idx_sort))
+        eigvals = eigvals_all[idx_sort[:take]]
+        eigvecs = eigvecs_all[:, idx_sort[:take]]
+
+    # default: skip trivial dominant eigenvector (index 0) and use next few
+    if eig_indices is None:
+        default_indices = list(range(1, min(5, eigvecs.shape[1])))
+        eig_indices = default_indices if len(default_indices) > 0 else [0]
+
+    eig_indices = [int(i) for i in eig_indices if 0 <= i < eigvecs.shape[1]]
+    if len(eig_indices) == 0:
+        eig_indices = [0]
+
+    selected = eigvecs[:, eig_indices]
+    if np.iscomplexobj(selected):
+        features = np.hstack([selected.real, selected.imag])
+    else:
+        features = selected.real
+
+    kmeans = KMeans(n_clusters=n_clusters, n_init=n_init,
+                    random_state=random_state)
+    labels = kmeans.fit_predict(features)
+
+    return {
+        'labels': labels,        # clustering labels for m-1 samples
+        'kmeans': kmeans,        # fitted KMeans object
+        'eigenvals': eigvals,    # eigenvalues of L
+        'eigenvecs': eigvecs,    # eigenvectors of L
+        'features': features,    # real/imag stacked features
+        'L': L                   # transfer operator used
+    }
+
+
+def classify_new_trajectory(X, labels, Y, k=10, threshold=0.5):
+    """
+    X: ndarray (n_samples, d)   -- original state space points
+    labels: ndarray (n_samples,) -- cluster labels for X (e.g. from k-means)
+    Y: ndarray (m_samples, d)   -- new trajectory to classify
+    k: int -- number of nearest neighbors
+    threshold: float in [0,1] -- fraction of neighbors required to assign regime
+
+    returns: ndarray (m_samples,) of regime labels for Y
+             (-1 if no cluster passes threshold)
+    """
+    nn = NearestNeighbors(n_neighbors=k).fit(X)
+    _, idxs = nn.kneighbors(Y)
+
+    Y_labels = []
+    for neighbors in idxs:
+        neigh_labels = labels[neighbors]
+        uniq, counts = np.unique(neigh_labels, return_counts=True)
+        dominant = uniq[np.argmax(counts)]
+        frac = counts.max() / k
+        if frac >= threshold:
+            Y_labels.append(dominant)
+        else:
+            Y_labels.append(-1)   # mark as "uncertain / outside"
+    return np.array(Y_labels)
+
+
 def fit_hmm(data_array, n_states=3, initial_centers=None):
     """
     Fit Hidden Markov Model with specified number of states.
@@ -1226,3 +1379,123 @@ def escape_times(regimes):
     escapes[mask] = next_changes - valid_i
 
     return escapes
+
+
+def plot_lifetime_distributions_lines(escape_results, regime, logx=True,
+                                      xlabel="Sigma"):
+    sigmas = sorted(escape_results[regime].keys())
+
+    medians = []
+    means = []
+    q25s = []
+    q75s = []
+    q0s = []
+    q95s = []
+
+    for sigma in sigmas:
+        data = np.array(escape_results[regime][sigma])
+        if len(data) == 0:
+            medians.append(np.nan)
+            means.append(np.nan)
+            q25s.append(np.nan)
+            q75s.append(np.nan)
+            q0s.append(np.nan)
+            q95s.append(np.nan)
+            continue
+
+        q0, q25, q50, q75, q95 = np.percentile(data, [0, 25, 50, 75, 95])
+        mean_val = np.mean(data)
+
+        q0s.append(q0)
+        q25s.append(q25)
+        medians.append(q50)
+        q75s.append(q75)
+        q95s.append(q95)
+        means.append(mean_val)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # median
+    ax.plot(sigmas, medians, marker=None,
+            color='black', linewidth=2, label='Median')
+
+    # mean
+    ax.plot(sigmas, means, marker=None, color='red',
+            linewidth=1.5, label='Mean')
+
+    # IQR shaded
+    ax.fill_between(sigmas, q25s, q75s, color='lightgray',
+                    alpha=0.7, label='IQR')
+
+    # 0th–95th percentile (dotted lines)
+    ax.plot(sigmas, q0s, linestyle=':', color='black', linewidth=1,
+            label='0–95th percentile' if regime == 0 else "")
+    ax.plot(sigmas, q95s, linestyle=':', color='black', linewidth=1)
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Lifetime (time steps)")
+    ax.set_title(f"Regime {regime} lifetime distributions")
+    if logx:
+        ax.set_xscale("log")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    return fig, ax
+
+
+def add_scaled_top_axis(fig, ax, sigmas, top_label=r"$\sqrt{\frac{\epsilon}{2}}$"):
+    """
+    Add a robust secondary x-axis (top) scaled as sqrt(2*x).
+
+    Mapping:
+        top = sqrt(2 * x)
+        bottom = (top**2) / 2
+
+    Handles zeros, negatives, NaNs, and Infs safely.
+    """
+
+    def scale_func(x):
+        x = np.asarray(x, dtype=float)
+        out = np.full_like(x, np.nan)
+        valid = np.isfinite(x) & (x > 0)
+        out[valid] = np.sqrt(x[valid] / 2)
+        # replace remaining invalids with 0 to prevent NaN/Inf axis limits
+        out[~valid] = 0
+        return out
+
+    def inverse_func(x_top):
+        x_top = np.asarray(x_top, dtype=float)
+        out = np.full_like(x_top, np.nan)
+        valid = np.isfinite(x_top) & (x_top >= 0)
+        out[valid] = (x_top[valid] ** 2) * 2
+        out[~valid] = 0
+        return out
+
+    # Create top axis with safe mapping
+    ax_top = ax.secondary_xaxis('top', functions=(scale_func, inverse_func))
+    ax_top.set_xlabel(top_label)
+
+    # Clip domain to avoid invalid transformations when autoscaling
+    xmin, xmax = ax.get_xlim()
+    xmin = max(xmin, 1e-12)  # avoid 0 or negative
+    ax.set_xlim(xmin, xmax)
+
+    fig.tight_layout()
+    return fig, ax_top
+
+
+def expected_escape_times_from_TO(L, mask):
+    """
+    L: scipy.sparse column-stochastic matrix
+    mask: boolean array with True for blocking set
+    """
+
+    # Restrict to blocking set
+    indices = np.where(mask)[0]
+    Q = L[indices, :][:, indices].tocsr()
+
+    # Solve (I - Q) t = 1 without forming dense inverse
+    I = eye(Q.shape[0], format='csr')
+    t_escape = spsolve(I - Q, np.ones(Q.shape[0]))
+
+    return t_escape
