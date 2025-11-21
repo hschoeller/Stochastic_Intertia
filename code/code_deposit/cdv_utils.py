@@ -1,8 +1,11 @@
-from scipy.sparse.linalg import spsolve
+from scipy.sparse.linalg import spsolve, spilu, LinearOperator, bicgstab, cg
+from scipy.sparse import eye, csr_matrix
+from scipy import integrate, special
+from matplotlib.colors import LinearSegmentedColormap
+from typing import Optional, Callable, List, Dict, Sequence
+from numba import njit, prange
 from scipy import sparse
 from sklearn.neighbors import NearestNeighbors
-from scipy.sparse.linalg import LinearOperator, cg
-from scipy.sparse import csr_matrix, eye
 import math
 from multiprocessing import Pool, cpu_count
 from collections import defaultdict
@@ -13,12 +16,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from scipy.spatial import KDTree
-from matplotlib.colors import LogNorm, BoundaryNorm
+from matplotlib.colors import LogNorm, BoundaryNorm, Normalize
 from itertools import combinations
 import numpy as np
 import os
 from matplotlib import cm
-from matplotlib.colors import Normalize
 # Define the state_vector type for the state_vector
 dtype = np.float64
 
@@ -297,7 +299,7 @@ def make_scatter_backgrounds(df, variable_pairs, color_var, categorical=False,
 
 def save_single_frame(args):
     """Create a frame with adaptive square subplots and a bottom plot with 1:4 aspect ratio."""
-    (t, df_columns, data, state_vector_t, output_folder, cmap,
+    (t, df_columns, data, state_vector_t, output_folder, cmap, norm,
      variable_pairs, pc_state_t, X, Y) = args
 
     num_pairs = len(variable_pairs)
@@ -332,7 +334,8 @@ def save_single_frame(args):
                   extent=hist_data["extent"],
                   cmap=cmap,
                   aspect='equal',
-                  origin='lower')
+                  origin='lower',
+                  norm=norm)
 
         var1_idx = df_columns.get_loc(var1)
         var2_idx = df_columns.get_loc(var2)
@@ -369,7 +372,7 @@ def save_single_frame(args):
 
 def save_time_step_plots_parallel(df, data, state_vector,
                                   output_folder="frames",
-                                  n_steps=1000, cmap='viridis_r',
+                                  n_steps=1000, cmap='viridis_r', norm=None,
                                   columns=None, n_processes=None,
                                   pc_state=None):
     """
@@ -396,11 +399,11 @@ def save_time_step_plots_parallel(df, data, state_vector,
     for t in range(n_steps):
         if pc_state is None:
             args = (t, df.columns, data, state_vector[t, :],
-                    output_folder, cmap, variable_pairs, pc_state,
+                    output_folder, cmap, norm, variable_pairs, pc_state,
                     X, Y)
         else:
             args = (t, df.columns, data, state_vector[t, :],
-                    output_folder, cmap, variable_pairs, pc_state[t, :],
+                    output_folder, cmap, norm, variable_pairs, pc_state[t, :],
                     X, Y)
         args_list.append(args)
 
@@ -535,7 +538,7 @@ def plot_scatter(df, var_name, cmap='viridis_r', categorical=False,
     return fig, ax
 
 
-def plot_density_heatmap(df, bins=200, cmap='viridis_r', columns=None,
+def plot_density_heatmap(df, bins=200, cmap='viridis_r', columns=None, variable_pairs=None,
                          axis_limits=None, points=None):
     """
     Plot a grid of 2D histograms for each unique pair of variables in df.
@@ -549,14 +552,16 @@ def plot_density_heatmap(df, bins=200, cmap='viridis_r', columns=None,
     else:
         x_columns = columns
     # Create variable pairs from x columns
-    variable_pairs = list(combinations(x_columns, 2))
+    if variable_pairs is None:
+        variable_pairs = list(combinations(x_columns, 2))
     n_plots = len(variable_pairs)
     ncols = min(n_plots, 5)
     nrows = (n_plots + ncols - 1) // ncols
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(3*ncols, 3*nrows))
     axes = axes.flatten() if n_plots > 1 else [axes]
-    fig.subplots_adjust(bottom=0.15)  # Adjust for color bar space
+    # Adjust for color bar space
+    fig.subplots_adjust(wspace=0.31, hspace=0.0, bottom=0.25)
     histograms = {}
     for idx, (var1, var2) in enumerate(variable_pairs):
         ax = axes[idx]
@@ -567,14 +572,14 @@ def plot_density_heatmap(df, bins=200, cmap='viridis_r', columns=None,
 
         if points is not None:
             if isinstance(points, dict):
-                # If dict, assume it has the same structure as df columns
                 x_vals = points.get(var1)
                 y_vals = points.get(var2)
                 if x_vals is not None and y_vals is not None:
-                    n_points = len(x_vals)
-                    colors = plt.cm.Set1(np.linspace(0, 1, n_points))
-                    ax.scatter(x_vals, y_vals, c=colors, s=50, alpha=0.8,
-                               edgecolors='black', linewidths=0.5)
+                    colors = ['black', 'red', 'orange']
+                    for i, (xv, yv) in enumerate(zip(x_vals, y_vals)):
+                        color = colors[i] if i < len(colors) else 'orange'
+                        ax.scatter(xv, yv, c=color, s=64, alpha=1,
+                                   edgecolors=color, linewidths=1, marker="x")
 
         if axis_limits:
             if var1 in axis_limits:
@@ -613,17 +618,24 @@ def plot_density_heatmap(df, bins=200, cmap='viridis_r', columns=None,
         }
         # Store the axis and color scale (image object)
         # Set axis labels
-        ax.set_xlabel(var1)
-        ax.set_ylabel(var2)
+        ax.set_xlabel(f"${var1}$", labelpad=2)
+        ax.set_ylabel(f"${var2}$", labelpad=2)
+        ax.xaxis.set_major_locator(plt.MultipleLocator(0.3))
+        ax.yaxis.set_major_locator(plt.MultipleLocator(0.3))
+
+        # ax.xaxis.set_major_locator(plt.MaxNLocator(nbins=3, prune=None))
+        # ax.yaxis.set_major_locator(plt.MaxNLocator(nbins=3, prune=None))
+        # ax.xaxis.set_major_formatter(
+        #     plt.FuncFormatter(lambda val, _: f"{val:.1f}"))
+        # ax.yaxis.set_major_formatter(
+        #     plt.FuncFormatter(lambda val, _: f"{val:.1f}"))
 
     # Add a shared color bar across all subplots
     cbarAx = fig.add_axes([0.15, 0.05, 0.7, 0.02])  # Adjust position and size
     fig.colorbar(h[3], cax=cbarAx, orientation='horizontal',
-                 label='Point Count (log scale)')
+                 label='Point Count')
 
-    plt.show()
-    plt.close(fig)
-    return histograms
+    return fig, histograms
 
 
 def generate_fourier_mode(n, m, X, Y):
@@ -667,13 +679,14 @@ def plot_fourier_mode(array, x, y, ax):
 
     # plt.contourf(x, y, array, cmap=cmap, levels=100, norm=norm)
     # , levels=100, norm=norm)
-    ax.contourf(x, y, array, cmap="RdBu", norm=norm)
+    im = ax.contourf(x, y, array, cmap="RdBu", norm=norm)
 
     # plt.colorbar(label='Amplitude')
     # plt.xlabel("x")
     # plt.ylabel("y")
     # plt.title("2D Fourier Mode")
     # plt.show()
+    return im
 
 
 def lin_comb(x, X, Y):
@@ -837,8 +850,12 @@ def diffusion_maps_matrix(X, epsilon):
         vals = vals[:p]
 
     # Gaussian kernel (note: using epsilon in denominator like exp(-d^2/epsilon))
-    A = sparse.coo_matrix((np.exp(-(vals**2) / epsilon),
-                          (rows, cols)), shape=(n_samples, n_samples)).tocsr()
+    if epsilon != 0.0:
+        A = sparse.coo_matrix((np.exp(-(vals**2) / epsilon),
+                               (rows, cols)), shape=(n_samples, n_samples)).tocsr()
+    else:
+        A = sparse.coo_matrix((np.zeros_like(vals),
+                               (rows, cols)), shape=(n_samples, n_samples)).tocsr()
 
     # ensure self-loop weight (set diagonal to 1.0)
     A.setdiag(1.0)
@@ -883,7 +900,9 @@ def compute_clusters_from_TO(DMM, n_eig=12, n_clusters=2, n_init=10,
     n = DMM.shape[0]
 
     # build time-shifted transfer operator (size (n-1, n-1))
-    L = DMM[1:, :-1].transpose()
+    L = sparse.vstack(
+        [DMM[1:], sparse.csr_matrix((1, DMM.shape[1]))], format='csr').transpose()
+    # L = DMM[1:, :-1].transpose()
 
     k_eigs = max(1, min(n_eig, L.shape[0] - 1))
 
@@ -1049,7 +1068,7 @@ def fit_hmm(data_array, n_states=3, initial_centers=None):
     print(f"Shape: {transition_matrix.shape}")
     for i in range(n_states):
         row_str = " ".join([f"{transition_matrix[i, j]:.4f}"
-                           for j in range(n_states)])
+                            for j in range(n_states)])
         print(f"State {i+1}: [{row_str}]")
     print()
 
@@ -1106,7 +1125,7 @@ def calculate_escape_times(state_sequence, dt=1.0):
         dt: float, time step between observations (default: 1.0)
 
     Returns:
-        dict: Dictionary with keys as state numbers, values as lists of 
+        dict: Dictionary with keys as state numbers, values as lists of
               escape times for that state
     """
     if not isinstance(state_sequence, np.ndarray):
@@ -1180,7 +1199,7 @@ def get_escape_times_for_points(state_sequence, target_state, dt=1.0):
         dt: float, time step between observations
 
     Returns:
-        tuple: (indices, escape_times) where indices are positions of 
+        tuple: (indices, escape_times) where indices are positions of
                target_state points and escape_times are corresponding times
     """
     if not isinstance(state_sequence, np.ndarray):
@@ -1413,7 +1432,7 @@ def plot_lifetime_distributions_lines(escape_results, regime, logx=True,
         q95s.append(q95)
         means.append(mean_val)
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(5, 3))
 
     # median
     ax.plot(sigmas, medians, marker=None,
@@ -1429,12 +1448,12 @@ def plot_lifetime_distributions_lines(escape_results, regime, logx=True,
 
     # 0th–95th percentile (dotted lines)
     ax.plot(sigmas, q0s, linestyle=':', color='black', linewidth=1,
-            label='0–95th percentile' if regime == 0 else "")
+            label='0–95th percentile')
     ax.plot(sigmas, q95s, linestyle=':', color='black', linewidth=1)
 
     ax.set_xlabel(xlabel)
-    ax.set_ylabel("Lifetime (time steps)")
-    ax.set_title(f"Regime {regime} lifetime distributions")
+    ax.set_ylabel("Lifetime")
+    # ax.set_title(f"Regime {regime} lifetime distributions")
     if logx:
         ax.set_xscale("log")
     ax.grid(True, alpha=0.3)
@@ -1499,3 +1518,957 @@ def expected_escape_times_from_TO(L, mask):
     t_escape = spsolve(I - Q, np.ones(Q.shape[0]))
 
     return t_escape
+
+
+def spy_col(Q):
+    coo = Q.tocoo()
+    sc = plt.scatter(coo.col, coo.row, c=np.abs(coo.data),
+                     s=50, marker='s', cmap='viridis')
+    ax = plt.gca()
+    ax.invert_yaxis()
+    ax.set_xlim(-0.5, Q.shape[1] - 0.5)
+    ax.set_ylim(Q.shape[0] - 0.5, -0.5)
+    ax.set_aspect('equal')
+    plt.colorbar(sc, ax=ax)
+    return ax
+
+
+# ------ TOY functions
+
+# Numba kernel (parallel over trajectories)
+
+
+@njit(parallel=True, cache=True)
+def _simulate_numba_parallel_sigma_arr(dt, sigma_arr, x0,
+                                       normals, reset_samples, save_every):
+    """
+    Numba-parallel kernel: independent trajectories in columns.
+    normals, reset_samples: shape (n_steps, n_paths)
+    sigma_arr: shape (n_paths,)
+    Returns saved states shape (n_saves, n_paths) dtype=float32
+    """
+    n_steps_local, n_paths = normals.shape
+    max_saves = (n_steps_local // save_every) + 1
+    saved = np.empty((max_saves, n_paths), dtype=np.float32)
+    noise = np.empty((max_saves, n_paths), dtype=np.float32)
+
+    phi = math.exp(dt)
+    var = (math.exp(2.0 * dt) - 1.0) / 2.0
+    sqrt_var = math.sqrt(var)
+
+    for p in prange(n_paths):
+        x = np.float32(x0)
+        save_idx = 0
+        saved[save_idx, p] = x
+        save_idx += 1
+
+        s = float(sigma_arr[p])
+        for i in range(n_steps_local):
+            # restart at start-of-step if outside [-2,2]
+            if x >= 2.0 or x <= -2.0:
+                sign = 1.0 if x >= 0.0 else -1.0
+                x = sign * reset_samples[i, p]
+            else:
+                # exact linear-step
+                x = x * phi + s * normals[i, p] * sqrt_var
+
+            if ((i + 1) % save_every) == 0:
+                saved[save_idx, p] = x
+                # noise[save_idx, p] = s * normals[i, p] * sqrt_var
+                save_idx += 1
+
+    return saved, noise
+
+
+def simulate_trajectories_per_sigma(
+        sigmas,
+        dt: float,
+        n_steps: int,
+        reset_sampler: Callable[[np.random.Generator, tuple], np.ndarray],
+        rng: Optional[np.random.Generator] = None,
+        save_every: int = 1,
+        x0: float = 0.0,
+        dtype=np.float32):
+    """
+    Simulate one continuous trajectory per sigma value in `sigmas`.
+    Args:
+      sigmas: scalar or 1-D array-like of sigma values (if scalar it will be converted to a length-1 array)
+      dt: time step
+      n_steps: number of integration steps (trajectory length)
+      reset_sampler: vectorized callable reset_sampler(rng, size) -> array shaped `size` of positive reset magnitudes
+      rng: np.random.Generator (if None a new generator is created)
+      save_every: save states every `save_every` steps (1 => save every step)
+      x0: initial condition
+      dtype: np.float32 recommended; set to np.float64 if you need double precision
+      verbose: print progress/timings if True
+
+    Returns:
+      times: 1D float array of saved times (length n_saves)
+      saved_states: 2D array shape (n_saves, n_paths), column j corresponds to sigmas[j]
+      sigma_arr: 1D array of sigma values (dtype)
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    n_paths = sigmas.shape[0]
+    n_saves = (n_steps // save_every) + 1
+
+    # Pre-sample normals and reset samples (shape: n_steps x n_paths)
+    normals = rng.normal(loc=0.0, scale=1.0, size=(
+        n_steps, n_paths)).astype(dtype, copy=False)
+    reset_samples = reset_sampler(rng, size=(
+        n_steps, n_paths)).astype(dtype, copy=False)
+
+    saved_states, noise = _simulate_numba_parallel_sigma_arr(float(dt), sigmas,
+                                                             float(x0),
+                                                             normals, reset_samples,
+                                                             int(save_every))
+    times = np.arange(n_saves, dtype=float) * (save_every * dt)
+    return times, saved_states,  sigmas
+
+
+# Example vectorized reset samplers (you must pass one of these or your own)
+def uniform_reset_sampler_vectorized(rng: np.random.Generator, size):
+    """
+    Returns reset magnitudes drawn uniformly on [low, high).
+    size: tuple (n_steps, n_paths)
+    """
+    low = 0.05
+    high = 0.1
+    return rng.uniform(low, high, size=size)
+
+
+def uniform_radius_sampler_vectorized(rng: np.random.Generator, size, low=0.05, high=0.1):
+    """
+    Returns radii of 3D vectors whose components are drawn uniformly from [low, high).
+
+    Parameters
+    ----------
+    rng : np.random.Generator
+        NumPy random generator.
+    size : tuple of ints
+        Output shape (e.g. (n_steps, n_paths)).
+    low, high : float
+        Bounds for uniform distribution of each vector component.
+
+    Returns
+    -------
+    radii : np.ndarray
+        Array of shape `size`, containing the Euclidean norms of 3D uniform vectors.
+    """
+    # sample independent 3D components
+    comps = rng.uniform(low, high, size=(*size, 3))
+    # compute Euclidean norm along the last axis
+    radii = np.linalg.norm(comps, axis=-1)/np.sqrt(3)
+    return radii
+
+
+def beta_symmetric_reset_sampler_vectorized(rng: np.random.Generator, size, a=2.0, b=2.0):
+    """
+    Return positive magnitudes u ~ Beta(a,b) in (0,1); kernel applies sign*reset_samples.
+    """
+    return rng.beta(a, b, size=size)
+
+
+def plot_trajectory_with_reinsertions(ax: Optional[plt.Axes],
+                                      times: np.ndarray,
+                                      states: np.ndarray,
+                                      jump_times: np.ndarray,
+                                      title: str = "Trajectory with reinsertion on |x|≥1",
+                                      show_ylabel: bool = True,
+                                      show_xlabel: bool = True) -> plt.Axes:
+    """
+    Plot a single trajectory (times, states) with reinsertion rug markers
+    and display the total number of reinsertions.
+    """
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 3.5))
+
+    ax.plot(times, states, lw=0.8, label='trajectory')
+    ax.axhline(1.0, ls="--", alpha=0.5)
+    ax.axhline(-1.0, ls="--", alpha=0.5)
+    ax.axhline(2.0, ls="--", alpha=0.5, color="grey")
+    ax.axhline(-2.0, ls="--", alpha=0.5, color="grey")
+    # Draw rug markers for reinsertion times
+    n_reinserts = int(jump_times.size)
+    if n_reinserts > 0:
+        rug_y = np.full_like(jump_times, -1.08)
+        ax.plot(jump_times, rug_y, linestyle='None', marker='|', markersize=8,
+                label='reinsertions', zorder=5)
+
+    # Annotate with total reinsertion count
+    ax.text(
+        0.02, 0.5,
+        f"reinsertions: {n_reinserts}",
+        transform=ax.transAxes,
+        fontsize=9,
+        verticalalignment='top',
+
+        bbox=dict(boxstyle='round', facecolor='white', alpha=0.7)
+    )
+
+    # Axis labels and title
+    if show_xlabel:
+        ax.set_xlabel("time")
+    if show_ylabel:
+        ax.set_ylabel("x(t)")
+    ax.set_title(title)
+
+    ax.legend(loc='right', fontsize='small')
+    ax.set_ylim(-2.15, 2.15)
+
+    return ax
+
+
+def plot_multiple_sigmas(times: np.ndarray,
+                         states: np.ndarray,
+                         sigmas: Sequence[float],
+                         reset_times_per_path: Sequence[np.ndarray],
+                         n_cols: int = 1,
+                         figsize: tuple = (8, 3),
+                         sharex: bool = True):
+    """
+    Create subplots showing trajectories for multiple sigma values.
+
+    Parameters
+    ----------
+    times : np.ndarray
+        Common time vector returned by simulate_over_sigmas.
+    results_dict : dict
+        Dictionary mapping sigma -> {'states', 'jump_times', 'jump_states'}.
+    sigmas : Sequence[float]
+        Array/list of sigma values to plot (must be keys of results_dict).
+    n_cols : int, optional
+        Number of subplot columns. Rows are computed automatically.
+    figsize : tuple, optional
+        Base figure size per row.
+    sharex : bool, optional
+        Whether to share x-axis among subplots.
+    """
+    n_sigmas = len(sigmas)
+    n_rows = int(np.ceil(n_sigmas / n_cols))
+
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(figsize[0] * n_cols,
+                                      figsize[1] * n_rows),
+                             sharex=sharex)
+    axes = np.atleast_1d(axes).flatten()
+
+    for i, sigma in enumerate(sigmas):
+        ax = axes[i]
+        data = states[:, i]
+        plot_trajectory_with_reinsertions(
+            ax=ax,
+            times=times,
+            states=data,
+            jump_times=reset_times_per_path[i],
+            title=f"σ = {sigma:.3f}",
+            show_xlabel=(i >= (n_rows - 1) * n_cols),
+            show_ylabel=(i % n_cols == 0)
+        )
+
+    # Hide any unused axes (if n_sigmas < n_rows * n_cols)
+    for j in range(n_sigmas, len(axes)):
+        axes[j].set_visible(False)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_multiple_trajectories(ax: Optional[plt.Axes],
+                               times: np.ndarray,
+                               states: np.ndarray,
+                               labels: List[str],
+                               title: str = None,
+                               text_loc: str = "center",
+                               show_ylabel: bool = True,
+                               show_xlabel: bool = True) -> plt.Axes:
+    """
+    Plot multiple trajectories given by `states` (shape: n_lines x n_times) 
+    with their corresponding `labels`. Horizontal lines are annotated.
+    """
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 3))
+
+    # Plot each trajectory
+    linestyles = ['-', '-.', ':']
+    for i in range(states.shape[1]):
+        ax.plot(times, states[:, i], lw=1.0, label=labels[i],
+                ls=linestyles[i % len(linestyles)])
+
+    ax.axhline(1.0, ls="--", alpha=0.5, color="black")
+    ax.axhline(-1.0, ls="--", alpha=0.5, color="black")
+    ax.axhline(2.0, ls="--", alpha=0.5, color="grey")
+    ax.axhline(-2.0, ls="--", alpha=0.5, color="grey")
+
+    if text_loc == "center":
+        ax.text(times[int(.5 * len(times))], -1.0,
+                f"Regime Boundary", va="bottom", ha="center")
+        ax.text(times[int(.5 * len(times))], -2.0, f"Reinsertion",
+                va="bottom", ha="center", color="grey")
+    elif text_loc == "right":
+        ax.text(times[-1], -1.0,
+                f"Regime Boundary", va="bottom", ha="right")
+        ax.text(times[-1], -2.0, f"Reinsertion",
+                va="bottom", ha="right", color="grey")
+    elif text_loc == "left":
+        ax.text(times[0], -1.0,
+                f"Regime Boundary", va="bottom", ha="left")
+        ax.text(times[0], -2.0, f"Reinsertion",
+                va="bottom", ha="left", color="grey")
+    else:
+        raise ValueError("text_loc must be 'center', 'right', or 'left'")
+
+    if show_xlabel:
+        ax.set_xlabel("$t$")
+    if show_ylabel:
+        ax.set_ylabel("$x(t)$")
+    ax.set_title(title)
+
+    ax.legend(title="$\sigma$", framealpha=1, loc="lower left")
+    ax.set_ylim(-2.2, 2.2)
+
+    return fig, ax
+
+
+def estimate_pdf_from_sampler(sampler_func,
+                              rng: np.random.Generator,
+                              n_samples: int = 100_000,
+                              n_bins: int = 200,
+                              sampler_kwargs: dict = None):
+    """
+    Estimate the PDF of radii returned by an arbitrary sampler function.
+    Works with samplers that expect `size` as a tuple.
+
+    Parameters
+    ----------
+    sampler_func : callable
+        Function of the form `sampler_func(rng, size, **kwargs)` returning an array of radii.
+    rng : np.random.Generator
+        NumPy random generator.
+    n_samples : int
+        Total number of samples to draw.
+    n_bins : int
+        Number of bins for histogram / PDF estimation.
+    sampler_kwargs : dict
+        Additional keyword arguments passed to sampler_func.
+
+    Returns
+    -------
+    bin_centers : np.ndarray
+        Centers of the histogram bins.
+    pdf_norm : np.ndarray
+        Normalized PDF values (max = 1).
+    """
+    if sampler_kwargs is None:
+        sampler_kwargs = {}
+
+    # Ensure size is a tuple for the sampler function
+    size_tuple = (n_samples,)
+
+    # Draw samples
+    radii = sampler_func(rng, size=size_tuple, **sampler_kwargs).ravel()
+
+    # Histogram as PDF
+    pdf_counts, bin_edges = np.histogram(radii, bins=n_bins, density=True)
+
+    # Normalize so max = 1
+    pdf_norm = pdf_counts / pdf_counts.max() if pdf_counts.max() > 0 else pdf_counts
+
+    # Bin centers
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    return bin_centers, pdf_norm
+
+
+def plot_multiple_trajectories_with_pdf_strip(ax: Optional[plt.Axes],
+                                              times: np.ndarray,
+                                              states: np.ndarray,
+                                              labels: List[str],
+                                              pdf_bins: np.ndarray,
+                                              pdf_values: np.ndarray,
+                                              title: str = None):
+    """
+    Plot multiple trajectories with a background strip colored according to a given PDF.
+    The y-axis corresponds to the support of the PDF (pdf_bins).
+
+    Parameters
+    ----------
+    ax : Optional[plt.Axes]
+        Matplotlib axes to plot on.
+    times : np.ndarray
+        1D array of time points.
+    states : np.ndarray
+        2D array of shape (n_times, n_lines) containing trajectories.
+    labels : List[str]
+        List of labels for each line.
+    pdf_bins : np.ndarray
+        Bin centers corresponding to the PDF support (y-axis).
+    pdf_values : np.ndarray
+        Normalized PDF values (max=1) to color the strip.
+    title : str
+        Plot title.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 3.5))
+
+    n_times, n_lines = states.shape
+
+    # 1) Create background strip from PDF
+    img_width = 100  # horizontal repetition
+    img = np.tile(pdf_values[:, np.newaxis], (1, img_width))
+
+    # colormap: white -> grey50
+    cmap = LinearSegmentedColormap.from_list(
+        "white_to_g50", [(1, 1, 1), (0.5, 0.5, 0.5)])
+
+    # vertical extent matches pdf_bins
+    y_min, y_max = pdf_bins[0], pdf_bins[-1]
+
+    ax.imshow(
+        img,
+        extent=(times[0], times[-1], y_min, y_max),
+        origin='lower',
+        aspect='auto',
+        cmap=cmap,
+        interpolation='nearest',
+        zorder=0
+    )
+
+    # 2) Plot trajectories with different linestyles
+    linestyles = ['-', '--', '-.', ':']
+    for i in range(n_lines):
+        style = linestyles[i % len(linestyles)]
+        ax.plot(times, states[:, i], lw=1.0, linestyle=style,
+                label=f"{labels[i]} ({style})", zorder=3)
+
+    # 3) Horizontal reference lines (optional)
+    ax.axhline(1.0, ls="--", alpha=0.5, color="black", zorder=1)
+    ax.axhline(-1.0, ls="--", alpha=0.5, color="black", zorder=1)
+    ax.axhline(2.0, ls="--", alpha=0.5, color="grey", zorder=1)
+    ax.axhline(-2.0, ls="--", alpha=0.5, color="grey", zorder=1)
+    ax.text(times[-1], -1.0, "Regime Boundary",
+            va="bottom", ha="right", zorder=4)
+    ax.text(times[-1], -2.0, "Reinsertion", va="bottom",
+            ha="right", color="grey", zorder=4)
+
+    # 4) Labels and legend
+    ax.set_xlabel("$t$")
+    ax.set_ylabel("$x(t)$")
+    if title is not None:
+        ax.set_title(title)
+    ax.legend(title="$\\sigma$", framealpha=1,
+              fontsize="small", loc="upper right")
+
+    plt.tight_layout()
+    return ax
+
+
+def compute_lifetimes_per_sigma_old(
+    states: np.ndarray,
+    sigma_arr: np.ndarray,
+    reset_threshold: float = 2.0,
+    hit_threshold: float = 1.0,
+) -> Dict[float, List[int]]:
+    """
+    Vectorized computation of lifetimes (number of saved timesteps after reinsertion until first hit |x| >= hit_threshold),
+    grouped by sigma. Censored events (no hit before end) are skipped.
+
+    Parameters
+    ----------
+    states : np.ndarray, shape (n_steps, n_paths)
+    sigma_arr : np.ndarray, shape (n_paths,)
+    reset_threshold : float
+        Threshold to detect reset (|x| > reset_threshold).
+    hit_threshold : float
+        Threshold that constitutes a hit (|x| >= hit_threshold).
+    Returns
+    -------
+    dict
+        {sigma_value: [lifetimes_as_ints, ...]}
+    """
+    n_paths = states.shape[1]
+    n_steps = states.shape[0]
+
+    abs_states = np.abs(states)
+    lifetimes_per_sigma = defaultdict(list)
+
+    for j in range(n_paths):
+        col = abs_states[:, j]
+
+        # indices where reset occurs (|x| > reset_threshold)
+        reset_idxs = np.nonzero(col > reset_threshold)[0]
+        if reset_idxs.size == 0:
+            continue
+
+        # indices where hit occurs (|x| >= hit_threshold)
+        hit_idxs = np.nonzero(col >= hit_threshold)[0]
+        if hit_idxs.size == 0:
+            # no hits at all -> all resets are censored, skip
+            continue
+
+        # reinsertion is immediately after reset index
+        reinsertion_idxs = reset_idxs + 1
+
+        # any reinsertion beyond saved data are censored
+        valid_mask = reinsertion_idxs < n_steps
+        if not np.any(valid_mask):
+            continue
+        reinsertion_idxs = reinsertion_idxs[valid_mask]
+        reset_idxs = reset_idxs[valid_mask]
+
+        # For each reinsertion index find the first hit index >= reinsertion using searchsorted
+        # searchsorted returns insertion positions in hit_idxs; if pos == len(hit_idxs) => no hit after reinsertion
+        pos = np.searchsorted(hit_idxs, reinsertion_idxs, side="left")
+
+        # filter out censored (pos == len(hit_idxs))
+        valid_pos_mask = pos < hit_idxs.size
+        if not np.any(valid_pos_mask):
+            continue
+
+        # corresponding hit indices for valid reinsertion events
+        hit_for_reset = hit_idxs[pos[valid_pos_mask]]
+
+        # lifetimes = hit_index - reinsertion_index (number of saved timesteps after reinsertion until hit)
+        lifetimes = (hit_for_reset -
+                     reinsertion_idxs[valid_pos_mask]).astype(int)
+
+        sigma = float(sigma_arr[j])
+        lifetimes_per_sigma[sigma].extend(lifetimes.tolist())
+
+    return dict(lifetimes_per_sigma)
+
+
+def compute_lifetimes_per_sigma(
+    states: np.ndarray,
+    sigma_arr: np.ndarray,
+    reset_threshold: float = 1.0,
+    hit_threshold: float = 1.0,
+) -> Dict[float, List[int]]:
+    """
+    Vectorized computation of lifetimes (number of saved timesteps after reinsertion until first hit |x| >= hit_threshold),
+    grouped by sigma. Censored events (no hit before end) are skipped.
+
+    NOTE: reinsertion (reset) detection now uses the drop in absolute |x| between consecutive saved timesteps:
+        reinsertion occurs where abs(states[t]) - abs(states[t+1]) > reset_threshold
+    This is useful when you've subsampled and the reset shows up as a large downward jump in |x|.
+
+    Parameters
+    ----------
+    states : np.ndarray, shape (n_steps, n_paths)
+    sigma_arr : np.ndarray, shape (n_paths,)
+    reset_threshold : float
+        Threshold on drop in |x| between consecutive saved timesteps to detect reinsertion (abs(t) - abs(t+1) > reset_threshold).
+    hit_threshold : float
+        Threshold that constitutes a hit (|x| >= hit_threshold).
+    Returns
+    -------
+    dict
+        {sigma_value: [lifetimes_as_ints, ...]}
+    """
+    n_paths = states.shape[1]
+    n_steps = states.shape[0]
+
+    abs_states = np.abs(states)
+    lifetimes_per_sigma = defaultdict(list)
+
+    for j in range(n_paths):
+        col = abs_states[:, j]
+
+        # new criterion: look for large drops between consecutive saved timesteps:
+        # drop at time t is abs_states[t] - abs_states[t+1]; we detect indices t where drop > reset_threshold
+        drops = col[:-1] - col[1:]
+        # these are t indices; reinsertion is at t+1
+        reset_idxs = np.nonzero(drops > reset_threshold)[0]
+        if reset_idxs.size == 0:
+            continue
+
+        # indices where hit occurs (|x| >= hit_threshold)
+        hit_idxs = np.nonzero(col >= hit_threshold)[0]
+        if hit_idxs.size == 0:
+            # no hits at all -> all resets are censored, skip
+            continue
+
+        # reinsertion is immediately after detected drop (t -> reinsertion at t+1)
+        reinsertion_idxs = reset_idxs + 1
+
+        # any reinsertion beyond saved data are censored (shouldn't happen because reinsertion_idxs <= n_steps-1)
+        valid_mask = reinsertion_idxs < n_steps
+        if not np.any(valid_mask):
+            continue
+        reinsertion_idxs = reinsertion_idxs[valid_mask]
+        reset_idxs = reset_idxs[valid_mask]
+
+        # For each reinsertion index find the first hit index >= reinsertion using searchsorted
+        pos = np.searchsorted(hit_idxs, reinsertion_idxs, side="left")
+
+        # filter out censored (pos == len(hit_idxs))
+        valid_pos_mask = pos < hit_idxs.size
+        if not np.any(valid_pos_mask):
+            continue
+
+        # corresponding hit indices for valid reinsertion events
+        hit_for_reset = hit_idxs[pos[valid_pos_mask]]
+
+        # lifetimes = hit_index - reinsertion_index (number of saved timesteps after reinsertion until hit)
+        lifetimes = (hit_for_reset -
+                     reinsertion_idxs[valid_pos_mask]).astype(int)
+
+        sigma = float(sigma_arr[j])
+        lifetimes_per_sigma[sigma].extend(lifetimes.tolist())
+
+    return dict(lifetimes_per_sigma)
+
+
+def constant_reset_sampler_factory(value, dtype=np.float32):
+    def reset_sampler(rng, size):
+        return np.full(size, value, dtype=dtype)
+    return reset_sampler
+
+
+def mean_escape_times_via_reinsertion_points(
+        sigmas: np.ndarray,
+        reinsertion_points: np.ndarray,
+        dt: float,
+        n_steps: int,
+        rng: np.random.Generator = None,
+        save_every: int = 1,
+        dtype=np.float32):
+    """
+    Uses compute_lifetimes_per_sigma to get lifetimes (in saved timesteps) per sigma,
+    converts to seconds via dt * save_every, and returns mean and counts arrays.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    sigmas = np.asarray(sigmas, dtype=float)
+    reinsertion_points = np.asarray(reinsertion_points, dtype=float)
+
+    n_sig = sigmas.size
+    n_r = reinsertion_points.size
+
+    mean_matrix = np.full((n_sig, n_r), np.nan, dtype=np.float64)
+    counts = np.zeros((n_sig, n_r), dtype=np.int64)
+
+    time_per_saved = float(dt * save_every)
+
+    for j, r in enumerate(reinsertion_points):
+        reset_sampler = constant_reset_sampler_factory(r, dtype=dtype)
+
+        times, states, sigma_arr = simulate_trajectories_per_sigma(
+            sigmas=sigmas.astype(np.float32),
+            dt=dt,
+            n_steps=n_steps,
+            reset_sampler=reset_sampler,
+            rng=rng,
+            save_every=save_every,
+            x0=float(r),
+            dtype=dtype
+        )
+
+        # Compute lifetimes per sigma using the helper you already have.
+        # lifetimes_dict: { sigma_value (float) : [lifetimes_in_saved_timesteps, ...] }
+        lifetimes_dict = compute_lifetimes_per_sigma_old(
+            states=states,
+            sigma_arr=sigma_arr,
+            reset_threshold=2.0,
+            hit_threshold=1.0
+        )
+        # fill mean_matrix and counts in the same order as `sigmas`
+        for i, sigma in enumerate(sigmas):
+            key = float(sigma)
+            lifesteps = lifetimes_dict.get(key, [])
+            cnt = len(lifesteps)
+            counts[i, j] = cnt
+            if cnt == 0:
+                mean_matrix[i, j] = np.nan
+            else:
+                durations_sec = np.asarray(
+                    lifesteps, dtype=float) * time_per_saved
+                mean_matrix[i, j] = float(np.mean(durations_sec))
+
+    return mean_matrix, counts
+
+
+def plot_mean_escape_by_reinsertion(sigmas, reinsertion_points, mean_matrix,
+                                    logx=True, xlabel="Sigma"):
+    """
+    Plot mean escape time vs sigma for several reinsertion points.
+    mean_matrix shape: (n_sigmas, n_reinsertion_points)
+    """
+    sigmas = np.asarray(sigmas)
+    # ensure sigmas sorted and reorder mean_matrix accordingly
+    order = np.argsort(sigmas)
+    sigmas_sorted = sigmas[order]
+    means_sorted = np.asarray(mean_matrix)[order, :]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for j, r in enumerate(reinsertion_points):
+        y = means_sorted[:, j]
+        mask = np.isfinite(y)
+        ax.plot(sigmas_sorted[mask], y[mask], marker='o', linewidth=1.8,
+                label=f"reinsert = {r}")
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Mean escape time")
+    ax.set_title("Mean escape time vs sigma (by reinsertion point)")
+    if logx:
+        ax.set_xscale("log")
+    ax.grid(True, alpha=0.3)
+    ax.legend(title="Reinsertion", loc="best")
+    plt.tight_layout()
+    return fig, ax
+
+
+# asymptotic expansion of erfi(u) for large u:
+# erfi(u) ~ exp(u^2)/(sqrt(pi)*u) * (1 + 1/(2u^2) + 3/(4u^4) + ...)
+# so exp(-u^2)*erfi(u) ~ 1/(sqrt(pi)*u) * (1 + 1/(2u^2) + ...)
+
+
+def tail_integrand_asym(u, terms=3):
+    # returns approximation to exp(-u^2)*erfi(u)
+    # using expansion up to O(u^{-2*terms})
+    # safe for |u| > ~5
+    s = 1.0 / (np.sqrt(np.pi) * u)
+    uu2 = u*u
+    # include a few correction terms
+    if terms >= 1:
+        s *= (1.0 + 1.0/(2.0*uu2))
+    if terms >= 2:
+        # not strict series-multiplicative, but good numeric
+        s *= (1.0 + 3.0/(4.0*uu2))
+    return s
+
+
+def f_scientific(x, sigma, U=6.0):
+    """Stable evaluation using domain split at +/-U (in u-space)."""
+    if sigma == 0:
+        return -np.log(np.abs(x)) if x != 0 else np.nan
+
+    u1 = -1.0 / np.sqrt(2.0 * sigma)
+    u2 = x / np.sqrt(2.0 * sigma)
+
+    # integrand: -sqrt(pi) * exp(-u^2) * erfi(u)
+    def integrand(u):
+        return -np.sqrt(np.pi) * np.exp(-u*u) * special.erfi(u)
+
+    # choose split points within [u1,u2] away from huge values
+    a = min(u1, u2)
+    b = max(u1, u2)
+
+    # if interval is small and within safe zone, integrate directly
+    SAFE_BOUND = U
+    if b <= SAFE_BOUND and a >= -SAFE_BOUND:
+        res, err = integrate.quad(
+            integrand, a, b, epsabs=1e-10, epsrel=1e-10, limit=200)
+        return res
+
+    # otherwise split into: [a, -U], [-U, U], [U, b], skipping empty pieces
+    total = 0.0
+
+    # left tail [a, -U]
+    left_end = -SAFE_BOUND
+    if a < left_end:
+        # approximate integral of integrand on [a, left_end] using asymptotic
+        # integrand ~ -sqrt(pi) * (1/(sqrt(pi)*u)) = -1/u  (first term)
+        # so integral approx = -log(|u|) between bounds plus small corrections.
+        # We'll integrate the asymptotic approximation numerically for safety.
+        def asymp(u):
+            return -np.sqrt(np.pi) * tail_integrand_asym(u)
+        res, err = integrate.quad(
+            asymp, a, left_end, epsabs=1e-10, epsrel=1e-10, limit=200)
+        total += res
+
+    # center [-U, U]
+    mid_a = max(a, -SAFE_BOUND)
+    mid_b = min(b, SAFE_BOUND)
+    if mid_b > mid_a:
+        res, err = integrate.quad(
+            integrand, mid_a, mid_b, epsabs=1e-10, epsrel=1e-10, limit=400)
+        total += res
+
+    # right tail [U, b]
+    right_start = SAFE_BOUND
+    if b > right_start:
+        def asymp(u):
+            return -np.sqrt(np.pi) * tail_integrand_asym(u)
+        res, err = integrate.quad(
+            asymp, right_start, b, epsabs=1e-10, epsrel=1e-10, limit=200)
+        total += res
+
+    return total
+
+
+def diffusion_maps_matrix_1d(X, epsilon):
+    """
+    1D-specialized version of diffusion_maps_matrix.
+    X: ndarray of shape (n_samples,) or (n_samples, 1)
+    epsilon: float > 0
+    Returns: (DMM, A) as scipy.sparse.csr_matrices (row-stochastic DMM, affinity A)
+    """
+    # flatten / validate 1D input
+    X_arr = np.asarray(X)
+    if X_arr.ndim == 2 and X_arr.shape[1] == 1:
+        X_flat = X_arr.ravel()
+    elif X_arr.ndim == 1:
+        X_flat = X_arr
+    else:
+        raise ValueError(
+            "diffusion_maps_matrix_1d expects 1D input (shape (n,) or (n,1)).")
+
+    n_samples = X_flat.shape[0]
+    if n_samples == 0:
+        # empty inputs
+        A = sparse.csr_matrix((n_samples, n_samples))
+        return A, A
+
+    # radius from epsilon (same choice as your original)
+    r = np.sqrt(5.0 * epsilon)
+
+    # sort points and use searchsorted to get neighbor windows efficiently
+    order = np.argsort(X_flat)
+    Xs = X_flat[order]   # sorted coordinates
+
+    rows = []
+    cols = []
+    vals = []
+
+    # For each sorted index, find neighbors in [x - r, x + r]
+    for i_sorted, x in enumerate(Xs):
+        left = np.searchsorted(Xs, x - r, side='left')
+        right = np.searchsorted(Xs, x + r, side='right')
+        if right <= left:
+            # no neighbors found (shouldn't happen since self is within window), but guard
+            continue
+        idxs_sorted = np.arange(left, right)
+        orig_rows = np.full(idxs_sorted.shape, order[i_sorted], dtype=np.int32)
+        orig_cols = order[idxs_sorted].astype(np.int32)
+        dists = np.abs(x - Xs[idxs_sorted]).astype(np.float64)
+
+        rows.append(orig_rows)
+        cols.append(orig_cols)
+        vals.append(dists)
+
+    # Concatenate lists
+    rows = np.concatenate(rows).astype(np.int32)
+    cols = np.concatenate(cols).astype(np.int32)
+    vals = np.concatenate(vals).astype(np.float64)
+
+    # Gaussian kernel: same convention as original: exp(-d^2 / epsilon)
+    A = sparse.coo_matrix((np.exp(-(vals**2) / epsilon),
+                          (rows, cols)), shape=(n_samples, n_samples)).tocsr()
+
+    # Ensure self-loop weight (set diagonal to 1.0)
+    A.setdiag(1.0)
+
+    # density normalization (Coifman–Lafon style with alpha = 1.0)
+    row_means = np.asarray(A.mean(axis=1)).ravel()
+    row_means[row_means == 0] = np.finfo(float).eps
+    q = 1.0 / row_means
+
+    alpha = 1.0
+    kalpha = q ** alpha
+    D_k = sparse.diags(kalpha, offsets=0, format='csr')
+    Adensnorm = D_k.dot(A).dot(D_k)
+
+    # row-normalize to get Markov matrix DMM
+    row_sums = np.asarray(Adensnorm.sum(axis=1)).ravel()
+    row_sums[row_sums == 0] = np.finfo(float).eps
+    inv_row_sums = 1.0 / row_sums
+    D_norm = sparse.diags(inv_row_sums, offsets=0, format='csr')
+    DMM = D_norm.dot(Adensnorm)
+
+    return DMM, A
+
+
+def expected_escape_times_from_TO_fast(L, mask,
+                                       direct_cutoff=4000,
+                                       ilu_drop_tol=1e-3,
+                                       krylov_tol=1e-8,
+                                       krylov_maxiter_factor=10,
+                                       richardson_tol=1e-8,
+                                       richardson_maxiter=5000):
+    """
+    Solve (I - Q) t = 1 where Q = L[indices, :][:, indices] and 'mask' selects the blocking set.
+
+    Strategy:
+      - If m <= direct_cutoff: use direct sparse solve (spsolve).
+      - Else: try ILU preconditioner + bicgstab.
+      - If ILU or bicgstab fails, fallback to simple Richardson iteration:
+            t_{k+1} = 1 + Q t_k
+        (equivalent to Neumann series) until convergence.
+
+    Parameters:
+      L : scipy.sparse matrix (transfer operator)
+      mask : boolean array selecting the blocking indices (source nodes)
+      direct_cutoff : int, size threshold below which a direct solve is used
+      ilu_drop_tol : float, drop tolerance for spilu preconditioner
+      krylov_tol : float, tolerance for bicgstab
+      krylov_maxiter_factor : int, max iterations = factor * m
+      richardson_tol : float, tolerance for Richardson residual
+      richardson_maxiter : int, max Richardson iterations
+
+    Returns:
+      t_escape : 1D numpy array of length m (floats)
+    """
+    indices = np.nonzero(mask)[0]
+    m = indices.size
+    if m == 0:
+        return np.array([], dtype=float)
+
+    # Build Q in csr (note: L may be row- or column-stochastic depending on pipeline;
+    # this matches your original usage of L[1:,:-1] indexing.)
+    Q = L[indices, :][:, indices].tocsr()
+
+    # build I - Q
+    IminusQ = eye(m, format='csr') - Q
+
+    # RHS vector
+    b = np.ones(m, dtype=float)
+
+    # 1) small problems: direct sparse solver
+    if m <= direct_cutoff:
+        t = spsolve(IminusQ, b)
+        return t
+
+    # 2) try ILU preconditioner + bicgstab
+    # spilu requires csc matrix
+    try:
+        # convert to csc for spilu and compute ILU factorization
+        ilu = spilu(IminusQ.tocsc(), drop_tol=ilu_drop_tol)
+        # create preconditioner as LinearOperator
+        M = LinearOperator((m, m), matvec=ilu.solve)
+
+        maxiter = int(krylov_maxiter_factor * m)
+        t, info = bicgstab(IminusQ, b, rtol=krylov_tol, maxiter=maxiter, M=M)
+        if info == 0:
+            return t
+        else:
+            # info > 0 means no convergence in maxiter; info < 0 means breakdown
+            # proceed to fallback
+            print(
+                f"bicgstab did not converge (info={info}), falling back to Richardson.")
+    except Exception as e:
+        # ILU failed (memory/zero pivot etc) -> fallback
+        print("ILU preconditioning failed or unavailable, falling back to Richardson. Exception:", e)
+
+    # 3) fallback: Richardson / Neumann fixed-point iteration
+    # iterate t_{k+1} = 1 + Q t_k, starting from t0 = 0
+    # stop when ||residual||/||b|| < tol, where residual = (I-Q)t - 1
+    t = np.zeros(m, dtype=float)
+    bnorm = np.linalg.norm(b)
+    if bnorm == 0:
+        bnorm = 1.0
+    for it in range(richardson_maxiter):
+        t_new = b + Q.dot(t)
+        # compute residual r = (I-Q) t_new - b = -Q(t_new - t)  -> easier compute r = t_new - Q.dot(t_new) - b
+        r = t_new - Q.dot(t_new) - b
+        res_norm = np.linalg.norm(r)
+        if res_norm / bnorm <= richardson_tol:
+            return t_new
+        t = t_new
+    # if still not converged, return last iterate with a warning
+    print(
+        f"Richardson did not converge in {richardson_maxiter} iterations; residual={res_norm:.3e}")
+    return t
