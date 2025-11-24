@@ -1,3 +1,5 @@
+from scipy.sparse.linalg import splu, spilu, gmres, LinearOperator
+from scipy import linalg
 from scipy.sparse.linalg import spsolve, spilu, LinearOperator, bicgstab, cg
 from scipy.sparse import eye, csr_matrix
 from scipy import integrate, special
@@ -1452,12 +1454,12 @@ def plot_lifetime_distributions_lines(escape_results, regime, logx=True,
     ax.plot(sigmas, q95s, linestyle=':', color='black', linewidth=1)
 
     ax.set_xlabel(xlabel)
-    ax.set_ylabel("Lifetime")
+    ax.set_ylabel("Regime Lifetime")
     # ax.set_title(f"Regime {regime} lifetime distributions")
     if logx:
         ax.set_xscale("log")
     ax.grid(True, alpha=0.3)
-    ax.legend()
+    ax.legend(framealpha=1.0)
     plt.tight_layout()
     return fig, ax
 
@@ -1662,6 +1664,31 @@ def uniform_radius_sampler_vectorized(rng: np.random.Generator, size, low=0.05, 
     return radii
 
 
+def normal_radius_sampler_vectorized(rng: np.random.Generator, size, scale=1e-2):
+    """
+    Returns radii of 3D vectors whose components are drawn from a normal distribution.
+
+    Parameters
+    ----------
+    rng : np.random.Generator
+        NumPy random generator.
+    size : tuple of ints
+        Output shape (e.g. (n_steps, n_paths)).
+    low, high : float
+        Bounds for uniform distribution of each vector component.
+
+    Returns
+    -------
+    radii : np.ndarray
+        Array of shape `size`, containing the Euclidean norms of 3D uniform vectors.
+    """
+    # sample independent 3D components
+    comps = rng.normal(loc=0, scale=scale, size=(*size, 3))
+    # compute Euclidean norm along the last axis
+    radii = np.linalg.norm(comps, axis=-1)/np.sqrt(3)
+    return radii
+
+
 def beta_symmetric_reset_sampler_vectorized(rng: np.random.Generator, size, a=2.0, b=2.0):
     """
     Return positive magnitudes u ~ Beta(a,b) in (0,1); kernel applies sign*reset_samples.
@@ -1673,7 +1700,7 @@ def plot_trajectory_with_reinsertions(ax: Optional[plt.Axes],
                                       times: np.ndarray,
                                       states: np.ndarray,
                                       jump_times: np.ndarray,
-                                      title: str = "Trajectory with reinsertion on |x|≥1",
+                                      title: str = r"Trajectory with reinsertion on $|x|\ge 1$",
                                       show_ylabel: bool = True,
                                       show_xlabel: bool = True) -> plt.Axes:
     """
@@ -1699,7 +1726,7 @@ def plot_trajectory_with_reinsertions(ax: Optional[plt.Axes],
     # Annotate with total reinsertion count
     ax.text(
         0.02, 0.5,
-        f"reinsertions: {n_reinserts}",
+        rf"\text{{reinsertions: {n_reinserts}}}",
         transform=ax.transAxes,
         fontsize=9,
         verticalalignment='top',
@@ -1709,9 +1736,9 @@ def plot_trajectory_with_reinsertions(ax: Optional[plt.Axes],
 
     # Axis labels and title
     if show_xlabel:
-        ax.set_xlabel("time")
+        ax.set_xlabel(r"$t$")
     if show_ylabel:
-        ax.set_ylabel("x(t)")
+        ax.set_ylabel(r"$x(t)$")
     ax.set_title(title)
 
     ax.legend(loc='right', fontsize='small')
@@ -1762,7 +1789,7 @@ def plot_multiple_sigmas(times: np.ndarray,
             times=times,
             states=data,
             jump_times=reset_times_per_path[i],
-            title=f"σ = {sigma:.3f}",
+            title=rf"$\sigma = {sigma:.3f}$",
             show_xlabel=(i >= (n_rows - 1) * n_cols),
             show_ylabel=(i % n_cols == 0)
         )
@@ -2380,6 +2407,99 @@ def diffusion_maps_matrix_1d(X, epsilon):
     DMM = D_norm.dot(Adensnorm)
 
     return DMM, A
+
+
+def solve_escape_from_Q(Q):
+    """
+    Solve (I - Q) x = 1 for x (expected escape times).
+    Input:
+      Q : scipy.sparse matrix or numpy.ndarray (square, shape (n,n))
+    Output:
+      x : 1D numpy array, solution to (I - Q) x = 1
+    Behavior:
+      - If Q is dense ndarray -> uses dense LAPACK solve.
+      - If Q is sparse -> uses an internal heuristic then:
+          1) try sparse direct LU (splu)
+          2) if that fails, try iterative GMRES with ILU preconditioner
+          3) if that fails, fall back to dense solve (convert to ndarray)
+      The function prints short diagnostic messages on which path was taken.
+      No user tuning required.
+    """
+
+    # Sanity checks
+    if not (hasattr(Q, "shape") and Q.shape[0] == Q.shape[1]):
+        raise ValueError("Q must be square")
+
+    n = Q.shape[0]
+    ones = np.ones(n, dtype=float)
+
+    # If Q is a dense ndarray -> dense solve immediately
+    if isinstance(Q, np.ndarray):
+        A = np.eye(n, dtype=float) - Q
+        # solve with LAPACK
+        x = linalg.solve(A, ones, assume_a='gen')
+        print(f"[dense] solved dense system (n={n}) via LAPACK.")
+        return x
+
+    # Otherwise treat as sparse
+    # ensure CSR for nnz/density queries, and CSC for LU
+    Q = sparse.csr_matrix(Q)
+    nnz = Q.nnz
+    density = float(nnz) / (n*n)
+
+    # estimate memory for dense array (bytes)
+    estimated_dense_bytes = n * n * 8
+    # Heuristic decision: if matrix is quite dense or dense memory is modest, prefer dense path.
+    # These are internal heuristics only — you don't need to change them.
+    prefer_dense = (density > 0.05) or (
+        estimated_dense_bytes <= 200 * 1024 * 1024)
+
+    A_sparse = sparse.eye(n, format='csr') - Q
+
+    # 1) Try sparse direct LU if we don't strongly prefer dense
+    if not prefer_dense:
+        try:
+            A_csc = A_sparse.tocsc()
+            # may raise MemoryError or take very long if matrix effectively dense
+            lu = splu(A_csc)
+            x = lu.solve(ones)
+            print(
+                f"[sparse-direct] used splu (n={n}, nnz={nnz}, density={density:.4g}).")
+            return x
+        except Exception as e:
+            # fallback to iterative or dense
+            print(
+                f"[sparse-direct] splu failed or not feasible: {type(e).__name__}: {e}")
+
+    # 2) Try iterative solver with ILU preconditioner (good for large sparse)
+    #    Use defaults; if it fails we move to dense fallback.
+    try:
+        A_csc = A_sparse.tocsc()
+        # build ILU preconditioner; default parameters used (no user tuning)
+        # may raise MemoryError on too-dense matrices
+        ilu = spilu(A_csc)
+        M = LinearOperator(A_csc.shape, ilu.solve)
+        x, info = gmres(A_csc, ones, M=M, rtol=1e-8)
+        if info == 0:
+            print(
+                f"[iterative] GMRES converged with ILU preconditioner (n={n}, nnz={nnz}, density={density:.4g}).")
+            return x
+        else:
+            print(
+                f"[iterative] GMRES did not converge (info={info}); falling back to dense. (n={n})")
+    except Exception as e:
+        print(f"[iterative] iterative path failed: {type(e).__name__}: {e}")
+
+    # 3) Dense fallback: convert to array and use LAPACK
+    try:
+        A_dense = (sparse.eye(n, format='csr') - Q).toarray()
+        x = linalg.solve(A_dense, ones, assume_a='gen')
+        print(
+            f"[dense-fallback] converted to dense and solved (n={n}, nnz={nnz}, density={density:.4g}).")
+        return x
+    except Exception as e:
+        # last resort: raise informative error
+        raise RuntimeError("All solve attempts failed. Last error: " + repr(e))
 
 
 def expected_escape_times_from_TO_fast(L, mask,
