@@ -2,7 +2,7 @@
 
 #SBATCH --job-name=CdV
 #SBATCH --partition=main
-#SBATCH --array=1-20
+#SBATCH --array=0-101
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --output=./logs/CdV_%a.out
@@ -11,12 +11,12 @@
 # The following is for compiling and running different sigmas
 sigmas=($(python3 - <<'EOF'
 import numpy as np
-vals = np.linspace(0, 0.05, 501)
+vals = np.linspace(0, 0.05, 101)
 print(" ".join(map(str, vals)))
 EOF
 ))
-# sigma=${sigmas[$SLURM_ARRAY_TASK_ID]}
-sigma=0.01
+sigma=${sigmas[$SLURM_ARRAY_TASK_ID]}
+# sigma=0.0
 safe_sigma=$(echo "$sigma" | sed 's/\./p/g')
 exe_name="exe/exe_${safe_sigma}"
 

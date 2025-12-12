@@ -1,13 +1,15 @@
-from scipy.sparse.linalg import splu, spilu, gmres, LinearOperator
-from scipy import linalg
-from scipy.sparse.linalg import spsolve, spilu, LinearOperator, bicgstab, cg
+from scipy.spatial.distance import cdist
+from matplotlib.colors import BoundaryNorm, ListedColormap, LinearSegmentedColormap, LogNorm, Normalize
+from scipy.spatial import cKDTree
+from matplotlib.patches import Rectangle
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
+from matplotlib.lines import Line2D
+from typing import Dict, List, Optional, Callable
+from scipy.sparse.linalg import splu, spilu, gmres, LinearOperator, bicgstab, cg, spsolve, eigs
+from scipy import linalg, integrate, special, sparse
 from scipy.sparse import eye, csr_matrix
-from scipy import integrate, special
-from matplotlib.colors import LinearSegmentedColormap
 from typing import Optional, Callable, List, Dict, Sequence
 from numba import njit, prange
-from scipy import sparse
-from sklearn.neighbors import NearestNeighbors
 import math
 from multiprocessing import Pool, cpu_count
 from collections import defaultdict
@@ -17,12 +19,11 @@ import matplotlib.colors as mcolors
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
-from scipy.spatial import KDTree
-from matplotlib.colors import LogNorm, BoundaryNorm, Normalize
 from itertools import combinations
 import numpy as np
 import os
 from matplotlib import cm
+from sklearn.cluster import KMeans
 # Define the state_vector type for the state_vector
 dtype = np.float64
 
@@ -92,9 +93,10 @@ def density_normalized_laplacian(positions, f, k=20, epsilon=None):
     n = positions.shape[0]
 
     # 1) k-NN search
-    nbrs = NearestNeighbors(n_neighbors=k+1, algorithm='auto', leaf_size=1000,
-                            n_jobs=-1).fit(positions)
-    dists, idxs = nbrs.kneighbors(positions)
+    tree = cKDTree(positions, leafsize=1000)
+
+    # Query k+1 nearest neighbors for all points
+    dists, idxs = tree.query(positions, k=k+1, n_jobs=-1)
     dists = dists[:, 1:]      # drop self-distance
     idxs = idxs[:, 1:]       # drop self-index
 
@@ -167,9 +169,9 @@ def smooth_assignments_graph_laplacian(points, assignments, smoothing_param,
 
     # Build k-NN graph
     if method == 'knn':
-        nbrs = NearestNeighbors(n_neighbors=k_neighbors+1,
-                                algorithm='auto').fit(points)
-        distances, indices = nbrs.kneighbors(points)
+        tree = cKDTree(points)
+        # Query k_neighbors + 1 neighbors (first is the point itself)
+        distances, indices = tree.query(points, k=k_neighbors + 1)
 
         # Remove self-connections
         distances = distances[:, 1:]
@@ -435,7 +437,7 @@ def build_df(state_vector, dims):
 
 def add_density_column(df, state_vector, distance_threshold):
     # Build a KDTree for efficient neighbor search in 6D space
-    tree = KDTree(state_vector)
+    tree = cKDTree(state_vector)
     # For each point, count the number of neighbors within the specified distance
     neighbor_counts = [len(tree.query_ball_point(
         point, distance_threshold)) - 1 for point in state_vector]
@@ -570,7 +572,7 @@ def plot_density_heatmap(df, bins=200, cmap='viridis_r', columns=None, variable_
 
         # Plot 2D histogram for each variable pair
         h = ax.hist2d(df[var1], df[var2], bins=bins,
-                      cmap=cmap, norm=LogNorm())
+                      cmap=cmap, norm=LogNorm(), rasterized=True)
 
         if points is not None:
             if isinstance(points, dict):
@@ -622,7 +624,11 @@ def plot_density_heatmap(df, bins=200, cmap='viridis_r', columns=None, variable_
         # Set axis labels
         ax.set_xlabel(f"${var1}$", labelpad=2)
         ax.set_ylabel(f"${var2}$", labelpad=2)
-        ax.xaxis.set_major_locator(plt.MultipleLocator(0.3))
+        x_min, x_max = df[var1].min(), df[var1].max()
+        if x_max - x_min < .5:
+            ax.xaxis.set_major_locator(plt.MultipleLocator(0.1))
+        else:
+            ax.xaxis.set_major_locator(plt.MultipleLocator(0.2))
         ax.yaxis.set_major_locator(plt.MultipleLocator(0.3))
 
         # ax.xaxis.set_major_locator(plt.MaxNLocator(nbins=3, prune=None))
@@ -819,74 +825,96 @@ def combine_binary_files(base_name, output_filename, dtype, dims,
 
 def diffusion_maps_matrix(X, epsilon):
     """
-    X: ndarray, shape (n_samples, n_features)
-    epsilon: float
-    returns: (DMM, A) as scipy.sparse matrices
+    Build diffusion-maps Markov matrix and affinity matrix using only SciPy.
+
+    Parameters
+    ----------
+    X : ndarray, shape (n_samples, n_features)
+        Data matrix.
+    epsilon : float
+        Kernel scale parameter (>0). Kernel used: exp(-d^2 / epsilon).
+
+    Returns
+    -------
+    DMM : scipy.sparse.csr_matrix
+        Row-stochastic diffusion maps matrix (Markov matrix).
+    A : scipy.sparse.csr_matrix
+        Symmetric affinity matrix with Gaussian kernel (diagonal entries = 1).
     """
+
     n_samples = X.shape[0]
-    r = np.sqrt(5.0 * epsilon)
+    r = 3.0 * np.sqrt(epsilon)
 
-    nbrs = NearestNeighbors(radius=r).fit(X)
-    distances_list, indices_list = nbrs.radius_neighbors(
-        X, return_distance=True)
+    tree = cKDTree(X)
+    indices_list = tree.query_ball_point(X, r, return_sorted=False)
 
-    # accumulate COO entries
-    total = sum(len(idx) for idx in indices_list)
-    rows = np.empty(total, dtype=np.int32)
-    cols = np.empty(total, dtype=np.int32)
-    vals = np.empty(total, dtype=np.float64)
+    rows = []
+    cols = []
+    vals = []
 
-    p = 0
-    for i, (idxs, dists) in enumerate(zip(indices_list, distances_list)):
-        li = len(idxs)
-        if li == 0:
-            continue
-        rows[p:p+li] = i
-        cols[p:p+li] = idxs
-        vals[p:p+li] = dists
-        p += li
+    for i, inds in enumerate(indices_list):
 
-    if p < total:
-        rows = rows[:p]
-        cols = cols[:p]
-        vals = vals[:p]
+        # compute distances only for returned neighbors, sort by distance
+        inds_arr = np.asarray(inds, dtype=int)
+        pts = X[inds_arr]
+        diffs = pts - X[i]  # shape (len(inds), n_features)
+        dists = np.linalg.norm(diffs, axis=1)
 
-    # Gaussian kernel (note: using epsilon in denominator like exp(-d^2/epsilon))
-    if epsilon != 0.0:
-        A = sparse.coo_matrix((np.exp(-(vals**2) / epsilon),
-                               (rows, cols)), shape=(n_samples, n_samples)).tocsr()
-    else:
-        A = sparse.coo_matrix((np.zeros_like(vals),
-                               (rows, cols)), shape=(n_samples, n_samples)).tocsr()
+        order = np.argsort(dists)
+        inds_sorted = inds_arr[order]
+        dists_sorted = dists[order]
 
-    # ensure self-loop weight (set diagonal to 1.0)
+        for j_idx, dist_ij in zip(inds_sorted, dists_sorted):
+            # add (i, j) entry
+            rows.append(i)
+            cols.append(int(j_idx))
+            vals.append(dist_ij)
+
+    if len(rows) == 0:
+        # no neighbors found within radius -> return trivial matrices
+        A = sparse.identity(n_samples, format='csr')
+        DMM = sparse.identity(n_samples, format='csr')
+        return DMM, A
+
+    rows = np.array(rows, dtype=np.int32)
+    cols = np.array(cols, dtype=np.int32)
+    vals = np.array(vals, dtype=np.float64)
+
+    # kernel: Gaussian using epsilon in denominator
+    weights = np.exp(-(vals ** 2) / epsilon)
+
+    # Build the symmetric affinity matrix (COO -> CSR)
+    A = sparse.coo_matrix((weights, (rows, cols)),
+                          shape=(n_samples, n_samples))
+
+    A = A.tocsr()
+
+    A = (A + A.T)
+
+    # Ensure diagonal = 1.0 (self-affinity exp(0)=1)
     A.setdiag(1.0)
 
-    # density normalization (Coifman–Lafon style with alpha = 1.0)
-    row_means = np.asarray(A.mean(axis=1)).ravel()
-    # avoid division by zero
-    row_means[row_means == 0] = np.finfo(float).eps
-    q = 1.0 / row_means
-
+    # --- Coifman-Lafon density normalization (alpha = 1.0) ---
     alpha = 1.0
-    kalpha = q ** alpha
-    D_k = sparse.diags(kalpha, offsets=0, format='csr')
-    Adensnorm = D_k.dot(A).dot(D_k)
+    # compute degree / density q_i = sum_j A_ij
+    q = np.asarray(A.sum(axis=1)).ravel()
 
-    # row-normalize to get Markov matrix DMM
-    row_sums = np.asarray(Adensnorm.sum(axis=1)).ravel()
+    D_alpha_inv = sparse.diags(q ** (-alpha), offsets=0, format='csr')
+    K = D_alpha_inv.dot(A).dot(D_alpha_inv)  # K = D_alpha^{-1} A D_alpha^{-1}
+
+    # Row-normalize K to obtain Markov matrix P (DMM)
+    row_sums = np.asarray(K.sum(axis=1)).ravel()
     row_sums[row_sums == 0] = np.finfo(float).eps
-    inv_row_sums = 1.0 / row_sums
-    D_norm = sparse.diags(inv_row_sums, offsets=0, format='csr')
-    DMM = D_norm.dot(Adensnorm)
+    D_row_inv = sparse.diags(1.0 / row_sums, offsets=0, format='csr')
+    DMM = D_row_inv.dot(K)
 
     return DMM, A
 
 
-def compute_clusters_from_TO(DMM, n_eig=12, n_clusters=2, n_init=10,
+def compute_clusters_from_TO(L, n_eig=12, n_clusters=2, n_init=10,
                              eig_indices=None, random_state=0):
     """
-    DMM: scipy.sparse matrix, shape (n_samples, n_samples)  -- diffusion-maps Markov matrix (row-stochastic)
+    L: scipy.sparse matrix, shape (n_samples, n_samples)  -- TO transposed
     n_eig: int -- number of eigenpairs to compute (ARPACK)
     n_clusters: int -- k for k-means
     n_init: int -- k-means n_init
@@ -895,16 +923,6 @@ def compute_clusters_from_TO(DMM, n_eig=12, n_clusters=2, n_init=10,
     random_state: int
     returns: dict with keys 'labels', 'kmeans', 'eigenvals', 'eigenvecs', 'features', 'L'
     """
-    import numpy as np
-    from scipy.sparse.linalg import eigs
-    from sklearn.cluster import KMeans
-
-    n = DMM.shape[0]
-
-    # build time-shifted transfer operator (size (n-1, n-1))
-    L = sparse.vstack(
-        [DMM[1:], sparse.csr_matrix((1, DMM.shape[1]))], format='csr').transpose()
-    # L = DMM[1:, :-1].transpose()
 
     k_eigs = max(1, min(n_eig, L.shape[0] - 1))
 
@@ -944,7 +962,6 @@ def compute_clusters_from_TO(DMM, n_eig=12, n_clusters=2, n_init=10,
         'eigenvals': eigvals,    # eigenvalues of L
         'eigenvecs': eigvecs,    # eigenvectors of L
         'features': features,    # real/imag stacked features
-        'L': L                   # transfer operator used
     }
 
 
@@ -959,8 +976,10 @@ def classify_new_trajectory(X, labels, Y, k=10, threshold=0.5):
     returns: ndarray (m_samples,) of regime labels for Y
              (-1 if no cluster passes threshold)
     """
-    nn = NearestNeighbors(n_neighbors=k).fit(X)
-    _, idxs = nn.kneighbors(Y)
+    tree = cKDTree(X)
+
+    # Query k nearest neighbors of each point in Y
+    dists, idxs = tree.query(Y, k=k)
 
     Y_labels = []
     for neighbors in idxs:
@@ -968,10 +987,10 @@ def classify_new_trajectory(X, labels, Y, k=10, threshold=0.5):
         uniq, counts = np.unique(neigh_labels, return_counts=True)
         dominant = uniq[np.argmax(counts)]
         frac = counts.max() / k
-        if frac >= threshold:
+        if frac > threshold:
             Y_labels.append(dominant)
         else:
-            Y_labels.append(-1)   # mark as "uncertain / outside"
+            Y_labels.append(-1)
     return np.array(Y_labels)
 
 
@@ -1552,7 +1571,7 @@ def _simulate_numba_parallel_sigma_arr(dt, sigma_arr, x0,
     n_steps_local, n_paths = normals.shape
     max_saves = (n_steps_local // save_every) + 1
     saved = np.empty((max_saves, n_paths), dtype=np.float32)
-    noise = np.empty((max_saves, n_paths), dtype=np.float32)
+    # noise = np.empty((max_saves, n_paths), dtype=np.float32)
 
     phi = math.exp(dt)
     var = (math.exp(2.0 * dt) - 1.0) / 2.0
@@ -1579,7 +1598,7 @@ def _simulate_numba_parallel_sigma_arr(dt, sigma_arr, x0,
                 # noise[save_idx, p] = s * normals[i, p] * sqrt_var
                 save_idx += 1
 
-    return saved, noise
+    return saved  # , noise
 
 
 def simulate_trajectories_per_sigma(
@@ -1620,10 +1639,10 @@ def simulate_trajectories_per_sigma(
     reset_samples = reset_sampler(rng, size=(
         n_steps, n_paths)).astype(dtype, copy=False)
 
-    saved_states, noise = _simulate_numba_parallel_sigma_arr(float(dt), sigmas,
-                                                             float(x0),
-                                                             normals, reset_samples,
-                                                             int(save_every))
+    saved_states = _simulate_numba_parallel_sigma_arr(float(dt), sigmas,
+                                                      float(x0),
+                                                      normals, reset_samples,
+                                                      int(save_every))
     times = np.arange(n_saves, dtype=float) * (save_every * dt)
     return times, saved_states,  sigmas
 
@@ -1753,7 +1772,9 @@ def plot_multiple_sigmas(times: np.ndarray,
                          reset_times_per_path: Sequence[np.ndarray],
                          n_cols: int = 1,
                          figsize: tuple = (8, 3),
-                         sharex: bool = True):
+                         sharex: bool = True,
+                         in3d: bool = False,
+                         show_reinserts: bool = True):
     """
     Create subplots showing trajectories for multiple sigma values.
 
@@ -1784,22 +1805,34 @@ def plot_multiple_sigmas(times: np.ndarray,
     for i, sigma in enumerate(sigmas):
         ax = axes[i]
         data = states[:, i]
-        plot_trajectory_with_reinsertions(
-            ax=ax,
-            times=times,
-            states=data,
-            jump_times=reset_times_per_path[i],
-            title=rf"$\sigma = {sigma:.3f}$",
-            show_xlabel=(i >= (n_rows - 1) * n_cols),
-            show_ylabel=(i % n_cols == 0)
-        )
+        if in3d:
+            plot_trajectory_with_reinsertions_3d(
+                ax=ax,
+                times=times,
+                states=data,
+                jump_times=reset_times_per_path[i],
+                title=f"$\sigma = {sigma:.3f}$",
+                show_xlabel=(i >= (n_rows - 1) * n_cols),
+                show_ylabel=(i % n_cols == 0),
+                show_reinserts=show_reinserts
+            )
+        else:
+            plot_trajectory_with_reinsertions(
+                ax=ax,
+                times=times,
+                states=data,
+                jump_times=reset_times_per_path[i],
+                title=rf"$\sigma = {sigma:.3f}$",
+                show_xlabel=(i >= (n_rows - 1) * n_cols),
+                show_ylabel=(i % n_cols == 0)
+            )
 
     # Hide any unused axes (if n_sigmas < n_rows * n_cols)
     for j in range(n_sigmas, len(axes)):
         axes[j].set_visible(False)
 
     plt.tight_layout()
-    plt.show()
+    return fig, axes
 
 
 def plot_multiple_trajectories(ax: Optional[plt.Axes],
@@ -2351,7 +2384,7 @@ def diffusion_maps_matrix_1d(X, epsilon):
         return A, A
 
     # radius from epsilon (same choice as your original)
-    r = np.sqrt(5.0 * epsilon)
+    r = np.sqrt(epsilon)*3
 
     # sort points and use searchsorted to get neighbor windows efficiently
     order = np.argsort(X_flat)
@@ -2407,6 +2440,115 @@ def diffusion_maps_matrix_1d(X, epsilon):
     DMM = D_norm.dot(Adensnorm)
 
     return DMM, A
+
+
+def make_L(X, epsilon):
+    """
+    1D-specialized version of diffusion_maps_matrix.
+    X: ndarray of shape (n_samples,) or (n_samples, 1)
+    epsilon: float > 0
+    Returns: (DMM, A) as scipy.sparse.csr_matrices (row-stochastic DMM, affinity A)
+    """
+    # flatten / validate 1D input
+    X_arr = np.asarray(X)
+    if X_arr.ndim == 2 and X_arr.shape[1] == 1:
+        X_flat_full = X_arr.ravel()
+    elif X_arr.ndim == 1:
+        X_flat_full = X_arr
+    else:
+        raise ValueError(
+            "diffusion_maps_matrix_1d expects 1D input (shape (n,) or (n,1)).")
+
+    last_p = X_flat_full[-1]
+    X_flat = X_flat_full[:-1]
+
+    n_samples = X_flat.shape[0]
+
+    if epsilon > 0:
+        # radius from epsilon (same choice as your original)
+        r = np.sqrt(epsilon)*3
+
+        # sort points and use searchsorted to get neighbor windows efficiently
+        order = np.argsort(X_flat)
+        Xs = X_flat[order]   # sorted coordinates
+
+        rows = []
+        cols = []
+        vals = []
+
+        # For each sorted index, find neighbors in [x - r, x + r]
+        for i_sorted, x in enumerate(Xs):
+            left = np.searchsorted(Xs, x - r, side='left')
+            right = np.searchsorted(Xs, x + r, side='right')
+
+            idxs_sorted = np.arange(left, right)
+            orig_rows = np.full(idxs_sorted.shape,
+                                order[i_sorted], dtype=np.int32)
+            orig_cols = order[idxs_sorted].astype(np.int32)
+            dists = np.abs(x - Xs[idxs_sorted]).astype(np.float64)
+
+            rows.append(orig_rows)
+            cols.append(orig_cols)
+            vals.append(dists)
+
+        # Concatenate lists
+        rows = np.concatenate(rows).astype(np.int32)
+        cols = np.concatenate(cols).astype(np.int32)
+        vals = np.concatenate(vals).astype(np.float64)
+
+        # Gaussian kernel: same convention as original: exp(-d^2 / epsilon)
+        A = sparse.coo_matrix((np.exp(-(vals**2) / epsilon),
+                               (rows, cols)), shape=(n_samples, n_samples)).tocsr()
+        A.setdiag(1.0)
+        # density normalization (Coifman–Lafon style with alpha = 1.0)
+        row_means = np.asarray(A.mean(axis=1)).ravel()
+        row_means[row_means == 0] = np.finfo(float).eps
+        q = 1.0 / row_means
+
+        alpha = 1.0
+        kalpha = q ** alpha
+        D_k = sparse.diags(kalpha, offsets=0, format='csr')
+        Adensnorm = D_k.dot(A).dot(D_k)
+
+        # row-normalize to get Markov matrix DMM
+        row_sums = np.asarray(Adensnorm.sum(axis=1)).ravel()
+        row_sums[row_sums == 0] = np.finfo(float).eps
+        inv_row_sums = 1.0 / row_sums
+        D_norm = sparse.diags(inv_row_sums, offsets=0, format='csr')
+        DMM = D_norm.dot(Adensnorm)
+        # construct L without last point
+        L = sparse.vstack(
+            [DMM[1:], sparse.csr_matrix((1, DMM.shape[1]))], format='csr')
+        # now the last point
+        order = np.argsort(X_flat_full)
+        Xs = X_flat_full[order]   # sorted coordinates
+        left = np.searchsorted(Xs, last_p - r, side='left')
+        right = np.searchsorted(Xs, last_p + r, side='right')
+        idxs_sorted = np.arange(left, right)
+        orig_rows = np.full(
+            idxs_sorted.shape[0] - 1, L.shape[0]-1, dtype=np.int32)
+        orig_cols = order[idxs_sorted].astype(np.int32)
+
+        dists = np.abs(last_p - Xs[idxs_sorted]).astype(np.float64)
+        dists = dists[orig_cols != L.shape[0]]
+        orig_cols = orig_cols[orig_cols != L.shape[0]]
+        values = np.exp(-(dists**2)/epsilon)
+
+        updates = csr_matrix(
+            (values/values.sum(), (orig_rows, orig_cols)),
+            shape=L.shape
+        )
+
+        L = L + updates
+    else:
+        # epsilon == 0 case: use identity matrix
+        DMM = sparse.eye(n_samples, format='csr')
+
+        # construct L without last point
+        L = sparse.vstack(
+            [DMM[1:], sparse.csr_matrix((1, DMM.shape[1]))], format='csr')
+
+    return L
 
 
 def solve_escape_from_Q(Q):
@@ -2592,3 +2734,948 @@ def expected_escape_times_from_TO_fast(L, mask,
     print(
         f"Richardson did not converge in {richardson_maxiter} iterations; residual={res_norm:.3e}")
     return t
+
+
+# --- Numba kernel (parallel over trajectories) for 3D states ---
+
+
+@njit(parallel=True, cache=True)
+def _simulate_numba_parallel_sigma_arr_3d(dt, sigma_arr, x0,
+                                          normals, reset_samples, save_every):
+    """
+    Numba-parallel kernel for 3D trajectories.
+    normals, reset_samples: shape (n_steps, n_paths, 3)
+    sigma_arr: shape (n_paths,)
+    Returns saved states shape (n_saves, n_paths, 3) dtype=float32
+    """
+    n_steps_local, n_paths, _ = normals.shape
+    max_saves = (n_steps_local // save_every) + 1
+    saved = np.empty((max_saves, n_paths, 3), dtype=np.float32)
+
+    phi = math.exp(dt)
+    var = (math.exp(2.0 * dt) - 1.0) / 2.0
+    sqrt_var = math.sqrt(var)
+
+    for p in prange(n_paths):
+        # initialize state x as a local 3-vector
+        x0_local0 = x0[0]
+        x0_local1 = x0[1]
+        x0_local2 = x0[2]
+
+        save_idx = 0
+        saved[save_idx, p, 0] = x0_local0
+        saved[save_idx, p, 1] = x0_local1
+        saved[save_idx, p, 2] = x0_local2
+        save_idx += 1
+
+        s = float(sigma_arr[p])
+        for i in range(n_steps_local):
+            # compute squared norm
+            norm2 = x0_local0 * x0_local0 + x0_local1 * x0_local1 + x0_local2 * x0_local2
+
+            # restart if outside ball of radius 2 (i.e., norm^2 >= 4)
+            if norm2 >= 4.0:
+                # reset_samples shape: (n_steps, n_paths, 3)
+                x0_local0 = reset_samples[i, p, 0]
+                x0_local1 = reset_samples[i, p, 1]
+                x0_local2 = reset_samples[i, p, 2]
+            else:
+                # exact linear step for each component + additive noise
+                # normals[i, p, k] ~ N(0,1)
+                x0_local0 = x0_local0 * phi + s * sqrt_var * normals[i, p, 0]
+                x0_local1 = x0_local1 * phi + s * sqrt_var * normals[i, p, 1]
+                x0_local2 = x0_local2 * phi + s * sqrt_var * normals[i, p, 2]
+            if ((i + 1) % save_every) == 0:
+                saved[save_idx, p, 0] = x0_local0
+                saved[save_idx, p, 1] = x0_local1
+                saved[save_idx, p, 2] = x0_local2
+                save_idx += 1
+    return saved
+
+
+def simulate_trajectories_per_sigma_3d(
+        sigmas,
+        dt: float,
+        n_steps: int,
+        reset_sampler: Callable[[np.random.Generator, tuple], np.ndarray],
+        rng: Optional[np.random.Generator] = None,
+        save_every: int = 1,
+        x0: Optional[np.ndarray] = None,
+        dtype=np.float32):
+    """
+    Simulate one 3D continuous trajectory per sigma value in `sigmas`.
+
+    Args
+      sigmas: scalar or 1-D array-like of sigma values (if scalar it will be converted to length-1 array)
+      dt: time step
+      n_steps: number of integration steps (trajectory length)
+      reset_sampler: vectorized callable reset_sampler(rng, size) -> array shaped `size`
+                     For 3D this should return shape (n_steps, n_paths, 3) containing **vectors** to reset to.
+      rng: np.random.Generator (if None a new generator is created)
+      save_every: save states every `save_every` steps (1 => save every step)
+      x0: initial condition (array-like of length 3). If None defaults to [0.1, 0.0, 0.0]
+      dtype: np.float32 recommended; set to np.float64 if you need double precision
+
+    Returns:
+      times: 1D float array of saved times (length n_saves)
+      saved_states: 3D array shape (n_saves, n_paths, 3), column j corresponds to sigmas[j]
+      sigma_arr: 1D array of sigma values (dtype)
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    n_paths = sigmas.shape[0]
+    n_saves = (n_steps // save_every) + 1
+
+    # Pre-sample normals and reset samples (shape: n_steps x n_paths x 3)
+    normals = rng.normal(loc=0.0, scale=1.0, size=(
+        n_steps, n_paths, 3)).astype(dtype, copy=False)
+    reset_samples = reset_sampler(rng, size=(
+        n_steps, n_paths, 3)).astype(dtype, copy=False)
+    saved_states = _simulate_numba_parallel_sigma_arr_3d(float(dt), sigmas.astype(dtype),
+                                                         x0.astype(
+        dtype),
+        normals, reset_samples,
+        int(save_every))
+    times = np.arange(n_saves, dtype=float) * (save_every * dt)
+    return times, saved_states, sigmas
+
+
+def sample_on_sphere(rng, size, radius=1.0):
+    """Sample points uniformly on the surface of a sphere with given radius."""
+    shape = size[:-1]
+    phi = rng.uniform(0, 2*np.pi, size=shape)
+    cos_theta = rng.uniform(-1, 1, size=shape)
+    sin_theta = np.sqrt(1 - cos_theta**2)
+    x = radius * sin_theta * np.cos(phi)
+    y = radius * sin_theta * np.sin(phi)
+    z = radius * cos_theta
+    return np.stack([x, y, z], axis=-1)
+
+
+def normal_reset_sampler_vectorized_3d(rng: np.random.Generator, size, scale=5e-2):
+    """
+    Returns reset vectors with independent components drawn from a normal distribution.
+    size: tuple (n_steps, n_paths, 3)
+    """
+    return rng.normal(loc=0.0, scale=scale, size=size)
+
+
+def uniform_reset_sampler_vectorized_3d(rng: np.random.Generator, size, low=-0.1, high=0.1):
+    """
+    Returns reset vectors with independent components drawn uniformly on [low, high).
+    size: tuple (n_steps, n_paths, 3)
+    """
+    return rng.uniform(low, high, size=size)
+
+
+def uniform_in_ball_reset_sampler_vectorized(rng: np.random.Generator, size, radius=0.1):
+    """
+    Returns reset vectors uniformly distributed in the 3D ball of given radius.
+    Uses rejection sampling; size is (n_steps, n_paths, 3) and the function returns that shape.
+    For moderate radius and typical sizes this is fine; for extreme performance consider direct radial sampling.
+    """
+    n_steps, n_paths, _ = size
+    out = np.empty(size, dtype=np.float64)
+    for i in range(n_steps):
+        for j in range(n_paths):
+            # rejection sampling per vector
+            while True:
+                v = rng.uniform(-radius, radius, size=3)
+                if v[0]*v[0] + v[1]*v[1] + v[2]*v[2] <= radius*radius:
+                    out[i, j, :] = v
+                    break
+    return out
+
+
+def plot_trajectory_with_reinsertions_3d(ax: Optional[plt.Axes],
+                                         times: np.ndarray,
+                                         states: np.ndarray,
+                                         jump_times: np.ndarray,
+                                         path_index: int = 0,
+                                         title: str = None,
+                                         show_ylabel: bool = True,
+                                         show_xlabel: bool = True,
+                                         show_reinserts: bool = True,
+                                         text_loc: str = "left") -> plt.Axes:
+    """
+    Plot a single 3D trajectory's three components on one axes and draw reinsertion rug markers.
+
+    Parameters
+    ----------
+    ax : Optional[plt.Axes]
+        Matplotlib axes to draw on. If None, a new figure/axes is created.
+    times : 1D array_like
+        Saved times (length n_saves).
+    states : array_like
+        Trajectory states. Accepted shapes:
+          - (n_saves, 3)          : single 3D trajectory
+          - (n_saves, n_paths, 3) : many trajectories; `path_index` selects which path to plot
+    jump_times : 1D array_like
+        Times of reinsertion events (rug markers).
+    path_index : int
+        If `states` has shape (n_saves, n_paths, 3), choose this path (default 0).
+    title : str
+        Plot title.
+    show_ylabel, show_xlabel : bool
+        Whether to show axis labels.
+
+    Returns
+    -------
+    ax : plt.Axes
+        The axes with the plot.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(9, 4))
+
+    times = np.asarray(times)
+    jump_times = np.asarray(jump_times)
+
+    states = np.asarray(states)
+    if states.ndim == 3:
+        # choose the requested path index
+        if path_index < 0 or path_index >= states.shape[1]:
+            raise IndexError(
+                "path_index out of range for states with shape (n_saves, n_paths, 3)")
+        traj = states[:, path_index, :]   # shape (n_saves, 3)
+    elif states.ndim == 2 and states.shape[1] == 3:
+        traj = states  # shape (n_saves, 3)
+    else:
+        raise ValueError(
+            "states must have shape (n_saves, 3) or (n_saves, n_paths, 3)")
+
+    # Plot the three components with distinct colours and labels
+    comp_labels = ["$x_1$", "$x_2$", "$x_3$"]
+    colors = ["C0", "C1", "C2"]
+    linestyles = ['-', '-.', ':']
+
+    for k in range(3):
+        ax.plot(times, traj[:, k], lw=0.9,
+                label=comp_labels[k], color=colors[k], linestyle=linestyles[k])
+
+    # Optional reference horizontal lines (analogous to 1D case)
+    ax.axhline(1.0, ls="--", alpha=0.5, color="black")
+    ax.axhline(-1.0, ls="--", alpha=0.5, color="black")
+    ax.axhline(2.0, ls="--", alpha=0.5, color="grey")
+    ax.axhline(-2.0, ls="--", alpha=0.5, color="grey")
+
+    # Annotate with total reinsertion count
+    if show_reinserts:
+        # rug markers for reinsertion times: place them slightly below the plotted data
+        n_reinserts = int(jump_times.size)
+        if n_reinserts > 0:
+            ymin = np.min(traj)
+            ymax = np.max(traj)
+            yrange = ymax - ymin if (ymax > ymin) else 1.0
+            rug_y = np.full_like(jump_times, ymin - 0.08 * yrange)
+            ax.plot(jump_times, rug_y, linestyle='None', marker='|', markersize=8,
+                    label='reinsertions', color='k', zorder=5)
+        ax.text(
+            0.02, 0.55,
+            f"reinsertions: {n_reinserts}",
+            transform=ax.transAxes,
+            fontsize=9,
+            verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.7)
+        )
+    if text_loc == "center":
+        ax.text(times[int(.5 * len(times))], -1.0,
+                f"Regime Boundary", va="bottom", ha="center")
+        ax.text(times[int(.5 * len(times))], -2.0, f"Reinsertion",
+                va="bottom", ha="center", color="grey")
+    elif text_loc == "right":
+        ax.text(times[-1], -1.0,
+                f"Regime Boundary", va="bottom", ha="right")
+        ax.text(times[-1], -2.0, f"Reinsertion",
+                va="bottom", ha="right", color="grey")
+    elif text_loc == "left":
+        ax.text(times[int(.01 * len(times))], -1.0,
+                f"Regime Boundary", va="bottom", ha="left")
+        ax.text(times[int(.01 * len(times))], -2.0, f"Reinsertion",
+                va="bottom", ha="left", color="grey")
+    # Labels / title
+    if show_xlabel:
+        ax.set_xlabel("$t$")
+    if show_ylabel:
+        ax.set_ylabel("$x_i(t)$")
+    ax.set_title(title)
+
+    ax.legend(loc='upper left', framealpha=1)
+    # set reasonable ylim with small margin
+    ax.set_ylim(-2.2, 2.2)
+
+    return ax
+
+
+def compute_lifetimes_per_sigma_3d(
+    states: np.ndarray,
+    sigma_arr: np.ndarray,
+    reset_threshold: float = 2.0,
+    hit_threshold: float = 1.0,
+) -> Dict[float, List[int]]:
+    """
+    Compute lifetimes for 3D trajectories.
+
+    Parameters
+    ----------
+    states : np.ndarray, shape (n_steps, n_paths, 3)
+        Saved states for each path (last axis = 3 components).
+    sigma_arr : np.ndarray, shape (n_paths,)
+        Sigma value for each path (same column ordering as states).
+    reset_threshold : float
+        Radius threshold for detecting a reset (norm > reset_threshold).
+    hit_threshold : float
+        Radius threshold that constitutes a hit (norm >= hit_threshold).
+
+    Returns
+    -------
+    dict
+        { sigma_value: [lifetimes_in_saved_timesteps, ...] }
+        Lifetimes are integers (number of saved timesteps after reinsertion until first hit).
+        Censored reinjections (no hit before end) are skipped.
+    """
+    if states.ndim != 3 or states.shape[2] != 3:
+        raise ValueError(
+            "states must be a 3D array with shape (n_steps, n_paths, 3)")
+    n_steps, n_paths, _ = states.shape
+    if sigma_arr.shape[0] != n_paths:
+        raise ValueError(
+            "sigma_arr length must match number of paths (states.shape[1])")
+
+    # compute radius for every saved time and path: shape (n_steps, n_paths)
+    radii = np.linalg.norm(states, axis=2)
+
+    lifetimes_per_sigma = defaultdict(list)
+
+    for j in range(n_paths):
+        col_r = radii[:, j]
+
+        # indices where reset occurs (radius > reset_threshold)
+        reset_idxs = np.nonzero(col_r > reset_threshold)[0]
+        if reset_idxs.size == 0:
+            continue
+
+        # indices where hit occurs (radius >= hit_threshold)
+        hit_idxs = np.nonzero(col_r >= hit_threshold)[0]
+        if hit_idxs.size == 0:
+            # no hits at all -> all resets are censored, skip
+            continue
+
+        # reinsertion is immediately after reset index
+        reinsertion_idxs = reset_idxs + 1
+
+        # any reinsertion beyond saved data are censored
+        valid_mask = reinsertion_idxs < n_steps
+        if not np.any(valid_mask):
+            continue
+        reinsertion_idxs = reinsertion_idxs[valid_mask]
+
+        # For each reinsertion find the first hit index >= reinsertion using searchsorted
+        pos = np.searchsorted(hit_idxs, reinsertion_idxs, side="left")
+
+        # filter out censored (pos == len(hit_idxs))
+        valid_pos_mask = pos < hit_idxs.size
+        if not np.any(valid_pos_mask):
+            continue
+
+        hit_for_reset = hit_idxs[pos[valid_pos_mask]]
+        reinj_valid = reinsertion_idxs[valid_pos_mask]
+
+        # lifetimes = hit_index - reinsertion_index (number of saved timesteps after reinsertion until hit)
+        lifetimes = (hit_for_reset - reinj_valid).astype(int)
+
+        sigma = float(sigma_arr[j])
+        lifetimes_per_sigma[sigma].extend(lifetimes.tolist())
+
+    return dict(lifetimes_per_sigma)
+
+
+def constant_radius_sampler_factory(radius, dtype=np.float32):
+    def sample_on_sphere(rng, size):
+        """Sample points uniformly on the surface of a sphere with given radius."""
+        shape = size[:-1]
+        phi = rng.uniform(0, 2*np.pi, size=shape)
+        cos_theta = rng.uniform(-1, 1, size=shape)
+        sin_theta = np.sqrt(1 - cos_theta**2)
+        x = radius * sin_theta * np.cos(phi)
+        y = radius * sin_theta * np.sin(phi)
+        z = radius * cos_theta
+        return np.stack([x, y, z], axis=-1)
+    return sample_on_sphere
+
+
+def mean_escape_times_via_reinsertion_radius3d(
+        sigmas: np.ndarray,
+        reinsertion_radius: np.ndarray,
+        dt: float,
+        n_steps: int,
+        rng: np.random.Generator = None,
+        save_every: int = 1,
+        dtype=np.float32):
+    """
+    Uses compute_lifetimes_per_sigma to get lifetimes (in saved timesteps) per sigma,
+    converts to seconds via dt * save_every, and returns mean and counts arrays.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    sigmas = np.asarray(sigmas, dtype=float)
+    reinsertion_radius = np.asarray(reinsertion_radius, dtype=float)
+
+    n_sig = sigmas.size
+    n_r = reinsertion_radius.size
+
+    mean_matrix = np.full((n_sig, n_r), np.nan, dtype=np.float64)
+    counts = np.zeros((n_sig, n_r), dtype=np.int64)
+
+    time_per_saved = float(dt * save_every)
+
+    for j, r in enumerate(reinsertion_radius):
+        reset_sampler = constant_radius_sampler_factory(r, dtype=dtype)
+
+        times, states, sigma_arr = simulate_trajectories_per_sigma_3d(
+            sigmas=sigmas,
+            dt=dt,
+            n_steps=n_steps,
+            reset_sampler=reset_sampler,
+            rng=rng,
+            save_every=save_every,
+            x0=np.array([r/np.sqrt(3), r/np.sqrt(3), r /
+                        np.sqrt(3)], dtype=np.float32),
+            dtype=dtype
+        )
+        # Compute lifetimes per sigma using the helper you already have.
+        # lifetimes_dict: { sigma_value (float) : [lifetimes_in_saved_timesteps, ...] }
+        lifetimes_dict = compute_lifetimes_per_sigma_3d(
+            states=states,
+            sigma_arr=sigma_arr
+        )
+        # fill mean_matrix and counts in the same order as `sigmas`
+        for i, sigma in enumerate(sigmas):
+            key = float(sigma)
+            lifesteps = lifetimes_dict.get(key, [])
+            cnt = len(lifesteps)
+            counts[i, j] = cnt
+            if cnt == 0:
+                mean_matrix[i, j] = np.nan
+            else:
+                durations_sec = np.asarray(
+                    lifesteps, dtype=float) * time_per_saved
+                mean_matrix[i, j] = float(np.mean(durations_sec))
+
+    return mean_matrix, counts
+
+
+def plot_means_with_inset(
+    means_ana, means, reinsert_TO, sigmas,
+    s=20, figsize=(6, 4),
+    inset_coords=(0.19, 0.23, 2.25, 2.65),
+    inset_width="55%", inset_height="55%",
+    legend_loc="lower left", legend_ncol=4,
+    axinset_xticks=None, axinset_yticks=None,
+    reinsertion_points=None,
+    dt_lower=1.0
+):
+    """
+    Plot analytic and approximate curves with an inset zoom.
+
+    Args:
+        means_ana: analytic mean values (n_sigmas x n_curves)
+        means: approximate means (n_sigmas x n_curves)
+        reinsert_TO: reinsertion values (n_sigmas x n_curves)
+        sigmas: noise strength array
+        s: marker size
+        figsize: figure size
+        inset_coords: (x1, x2, y1, y2) limits of inset
+        inset_width, inset_height: inset size
+        legend_loc: legend location
+        legend_ncol: legend columns
+        axinset_xticks, axinset_yticks: tick locators for inset axes (Optional)
+        reinsertion_points: values to label the legend
+        dt_lower: scaling for reinsert_TO
+    """
+    cmap = plt.get_cmap("tab10")
+    colors = [cmap(i) for i in range(6)]
+    markers = ['o', 's', '^', 'D', 'v', 'P']
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Plot analytic curves
+    if means_ana is not None:
+        for j in range(means_ana.shape[1]):
+            ax.plot(sigmas, means_ana[:, j], linestyle='-',
+                    linewidth=1, color=colors[j])
+
+    # Plot approximations
+    for j in range(means.shape[1]):
+        ax.scatter(sigmas, means[:, j], marker=markers[j], s=s, linewidths=1,
+                   edgecolors=colors[j], alpha=1, zorder=3)
+
+    # Plot reinsertion points
+    for j in range(reinsert_TO.shape[1]):
+        ax.scatter(sigmas, reinsert_TO[:, j]*dt_lower, marker=markers[j], s=s,
+                   linewidths=1, edgecolors=colors[j], facecolors='none', alpha=1)
+
+    # Legend
+    if reinsertion_points is None:
+        reinsertion_points = range(reinsert_TO.shape[1])
+    labels = [f"{val:g}" for val in reinsertion_points]
+    handles = [Line2D([0], [0], color=colors[i], marker=markers[i],
+                      linestyle='-', markersize=7, markeredgewidth=0.8)
+               for i in range(len(labels))]
+
+    ax.legend(handles, labels, title="Reinsertion Points", loc=legend_loc,
+              frameon=False, ncols=legend_ncol)
+
+    # Inset axes
+    x1, x2, y1, y2 = inset_coords
+    axins = inset_axes(ax, width=inset_width, height=inset_height, loc="upper right",
+                       bbox_to_anchor=(0.0, 0.0, 1, 1), bbox_transform=ax.transAxes)
+    axins.set_xlim(x1, x2)
+    axins.set_ylim(y1, y2)
+
+    for j in range(means.shape[1]):
+        if means_ana is not None:
+            axins.plot(sigmas, means_ana[:, j],
+                       linestyle='-', linewidth=1, color=colors[j])
+        axins.scatter(sigmas, means[:, j], marker=markers[j], s=s, linewidths=1,
+                      edgecolors=colors[j], alpha=1, zorder=3)
+        axins.scatter(sigmas, reinsert_TO[:, j]*dt_lower, marker=markers[j], s=s,
+                      linewidths=1, edgecolors=colors[j], facecolors='none', alpha=1)
+
+    if axinset_xticks is not None:
+        axins.xaxis.set_major_locator(axinset_xticks)
+    if axinset_yticks is not None:
+        axins.yaxis.set_major_locator(axinset_yticks)
+
+    axins.grid(alpha=0.2)
+
+    # Rectangle + connector
+    rect = Rectangle((x1, y1), x2-x1, y2-y1, linewidth=1.0, edgecolor='gray',
+                     facecolor='none', linestyle='--', zorder=5)
+    ax.add_patch(rect)
+    mark_inset(ax, axins, loc1=3, loc2=4, fc="none", ec="0.5", linewidth=0.8)
+
+    ax.set_xlabel("Noise Strength $\sigma$")
+    ax.set_ylabel("Mean Escape Time")
+    ax.grid(alpha=0.25)
+    ax.set_xlim(0, sigmas[-1])
+    plt.tight_layout()
+    return fig, ax, axins
+
+
+def make_L3d(X, epsilon):
+    """
+    3D-specialized version of the original make_L.
+    X: ndarray of shape (n_samples, 3)
+       The last row of X is treated specially (mirrors original function logic).
+    epsilon: float > 0
+    Returns: L as scipy.sparse.csr_matrix (row-stochastic Markov matrix)
+
+    Notes:
+      - Uses cKDTree for efficient neighbor queries within radius r = sqrt(epsilon)*3.
+      - Builds an affinity matrix A using Gaussian kernel exp(-d^2/epsilon).
+      - Applies Coifman–Lafon density normalization with alpha = 1.0 (same as original).
+      - Builds DMM (row-stochastic) for the first (n-1) points, then constructs L by
+        stacking DMM[1:] and a bottom row computed from the last point's affinities
+        (matching logic from your provided 1D function).
+    """
+    X = np.asarray(X, dtype=np.float64)
+
+    # Separate last special point
+    last_p = X[-1]
+    X_flat = X[:-1]               # shape (n_samples, 3)
+    n_samples = X_flat.shape[0]
+
+    if epsilon > 0:
+        # radius consistent with your original choice
+        r = np.sqrt(epsilon) * 3.0
+
+        # Build KD-tree for the (n) points (excluding the last special one)
+        tree = cKDTree(X_flat)
+
+        # query_ball_point on all points returns list of neighbor indices for each point
+        # shape (m,2), each row (i,j) with i<j
+        pairs = tree.query_pairs(r=r, output_type='ndarray')
+
+        rows = []
+        cols = []
+        vals = []
+
+        if pairs.size > 0:
+            # compute distances for each unordered pair exactly once
+            i_idx = pairs[:, 0]
+            j_idx = pairs[:, 1]
+
+            diffs = X_flat[i_idx] - X_flat[j_idx]
+            dists = np.sqrt((diffs * diffs).sum(axis=1)).astype(np.float64)
+
+            # add both directions (i->j and j->i)
+            rows.append(i_idx.astype(np.int32))
+            cols.append(j_idx.astype(np.int32))
+            vals.append(dists)
+
+            rows.append(j_idx.astype(np.int32))
+            cols.append(i_idx.astype(np.int32))
+            vals.append(dists)
+
+        # add self-loops once (distance = 0)
+        diag_idx = np.arange(n_samples, dtype=np.int32)
+        rows.append(diag_idx)
+        cols.append(diag_idx)
+        vals.append(np.zeros(n_samples, dtype=np.float64))
+
+        # concatenate arrays
+        rows = np.concatenate(rows).astype(np.int32)
+        cols = np.concatenate(cols).astype(np.int32)
+        vals = np.concatenate(vals).astype(np.float64)
+        # affinity weights using Gaussian kernel
+        A = sparse.coo_matrix((np.exp(-(vals**2) / epsilon), (rows, cols)),
+                              shape=(n_samples, n_samples)).tocsr()
+
+        # ensure self-loop weight (set diagonal to 1.0)
+        A.setdiag(1.0)
+
+        # density normalization (Coifman–Lafon style with alpha = 1.0)
+        row_means = np.asarray(A.mean(axis=1)).ravel()
+        q = 1.0 / row_means
+
+        alpha = 1.0
+        kalpha = q ** alpha
+        D_k = sparse.diags(kalpha, offsets=0, format='csr')
+        Adensnorm = D_k.dot(A).dot(D_k)
+
+        # row-normalize to get Markov matrix DMM
+        row_sums = np.asarray(Adensnorm.sum(axis=1)).ravel()
+        inv_row_sums = 1.0 / row_sums
+        D_norm = sparse.diags(inv_row_sums, offsets=0, format='csr')
+        # shape (n_samples, n_samples), row-stochastic
+        DMM = D_norm.dot(Adensnorm)
+
+        L = sparse.vstack(
+            [DMM[1:], sparse.csr_matrix((1, DMM.shape[1]))], format='csr')
+
+        tree_full = cKDTree(X)
+
+        neighbors_full = np.array(
+            tree_full.query_ball_point(last_p, r=r), dtype=int)
+        cols_last = neighbors_full[neighbors_full < X_flat.shape[0]]
+
+        # if only one neighbor, add the next nearest
+        if cols_last.size == 1:
+            print(
+                "Only one neighbor found for last point; adding second nearest neighbor.")
+            dists_knn, inds_knn = tree_full.query(last_p, k=3)
+            # keep only the neighbor(s) in X_flat, exclude last point itself
+            mask = inds_knn < X_flat.shape[0]
+            cols_last = inds_knn[mask]
+            dists_last = dists_knn[mask]
+        else:
+            diffs_last = X_flat[cols_last] - last_p
+            dists_last = np.linalg.norm(diffs_last, axis=1)
+
+        # compute affinities and normalize
+        vals_last = np.exp(-(dists_last**2) / epsilon)
+        normalized_vals = vals_last / vals_last.sum()
+
+        orig_rows = np.full(normalized_vals.shape, L.shape[0] - 1, dtype=int)
+        orig_cols = cols_last.astype(int)
+        updates = csr_matrix(
+            (normalized_vals, (orig_rows, orig_cols)), shape=L.shape)
+        L = L + updates
+
+    else:
+        DMM = sparse.eye(n_samples, format='csr')
+        L = sparse.vstack(
+            [DMM[1:], sparse.csr_matrix((1, DMM.shape[1]))], format='csr')
+
+    return L
+
+
+# Maxwell PDF function (same as before)
+
+
+def maxwell_pdf(r, sd):
+    r = np.asarray(r)
+    coeff = np.sqrt(2/np.pi) / sd**3
+    pdf = coeff * r**2 * np.exp(-r**2 / (2*sd**2))
+    return np.where(r >= 0, pdf, 0.0)
+
+
+def add_radius_histogram_to_right(fig, points, pdf="Maxwell",
+                                  param=0.1, bins=30, hist_alpha=1,
+                                  r_max=2):
+    """
+    Add a second subplot to the right of the existing one in `fig`.
+    Plots a density histogram of radii and overlays the Maxwell pdf with given sd.
+    """
+    r = np.linalg.norm(points, axis=1)
+    N = r.size
+    # ---- Create a wider layout using GridSpec ----
+    # more room for subplot 2
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.3, 1.0])
+
+    # Reassign original ax into gs[0]
+    ax_old = fig.axes[0]
+    ax_old.set_position(gs[0].get_position(fig))
+    ax_old.set_subplotspec(gs[0])
+
+    # Create second subplot on the right
+    ax2 = fig.add_subplot(gs[1])
+    # pdf grid
+    r_grid = np.linspace(0, r_max, 400)
+
+    # histogram as density
+    n, bins, patches = ax2.hist(r, bins=bins, density=False, alpha=hist_alpha,
+                                label='Empirical (hist)', edgecolor='none')
+    bin_widths = np.diff(bins)
+    avg_bw = bin_widths.mean()
+    if pdf == "Maxwell":
+        sd = param
+        # Maxwell pdf
+        ax2.plot(r_grid, maxwell_pdf(r_grid, sd) * N * avg_bw,
+                 lw=2, label=f'Maxwell pdf (sd={sd})')
+    elif pdf == "uniform":
+        scale = param
+        un_pdf = 3*(r_grid**2)/(scale**3)
+
+        ax2.plot(r_grid, un_pdf * N * avg_bw, lw=2,
+                 label=f'Uniform pdf (scale={scale})')
+    # right-side y-axis
+    ax2.yaxis.tick_right()
+    ax2.yaxis.set_label_position("right")
+
+    ax2.set_xlabel('$r$')
+    ax2.set_ylabel('Count')
+    ax2.set_ylim(0, max(n))
+    ax2.set_xlim(0, r_max)
+    plt.tight_layout()
+    return fig, ax2
+
+
+def cartesian_to_spherical(points):
+    """Convert Nx3 cartesian coordinates to spherical (theta, phi)."""
+    x, y, z = points[:, 0], points[:, 1], points[:, 2]
+    r = np.sqrt(x**2 + y**2 + z**2)
+    theta = np.arccos(np.clip(z / r, -1, 1))
+    phi = np.arctan2(y, x)
+    return theta, phi
+
+
+def visualize_sphere_sampling(points, n_theta_bins=30, n_phi_bins=60, figsize=(6, 4)):
+    """
+    Create equal-area 2D histogram of 3D point distribution on sphere.
+
+    Parameters
+    ----------
+    points : ndarray of shape (n_samples, 3)
+        3D cartesian coordinates
+    n_theta_bins : int
+        Number of bins for polar angle (latitude-like)
+    n_phi_bins : int
+        Number of bins for azimuthal angle (longitude-like)
+    """
+    theta, phi = cartesian_to_spherical(points)
+
+    cos_theta = np.cos(theta)
+    theta_edges = np.arccos(np.linspace(1, -1, n_theta_bins + 1))
+    phi_edges = np.linspace(-np.pi, np.pi, n_phi_bins + 1)
+
+    histogram, _, _ = np.histogram2d(
+        theta, phi, bins=[theta_edges, phi_edges]
+    )
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    hist_int = histogram.astype(int)
+    max_count = hist_int.max()
+
+    n_categories = 8
+    boundaries = np.linspace(-0.5, max_count + 0.5, n_categories + 1)
+
+    colors = plt.cm.viridis(np.linspace(0, 1, n_categories))
+    cmap = ListedColormap(colors)
+    norm = BoundaryNorm(boundaries, cmap.N)
+
+    category_maxima = boundaries[1:]
+    category_labels = [f'$\\leq{int(np.ceil(m - 0.5))}$'
+                       for m in category_maxima]
+
+    theta_centers = (theta_edges[:-1] + theta_edges[1:]) / 2
+    phi_centers = (phi_edges[:-1] + phi_edges[1:]) / 2
+
+    mesh = ax.pcolormesh(
+        np.degrees(phi_centers),
+        -np.cos(theta_centers),
+        histogram,
+        cmap=cmap,
+        norm=norm,
+        shading='nearest'
+    )
+
+    cbar = plt.colorbar(mesh, ax=ax, spacing='proportional')
+    cbar.set_label('Sample Count', rotation=270, labelpad=20)
+    tick_positions = (boundaries[:-1] + boundaries[1:]) / 2
+    cbar.set_ticks(tick_positions)
+    cbar.set_ticklabels(category_labels)
+
+    ax.set_xlabel('$\\varphi$')
+    ax.set_ylabel('$\\cos(\\theta)$')
+    ax.set_xlim(-180, 180)
+    ax.set_ylim(-1, 1)
+
+    plt.tight_layout()
+    return fig, ax
+
+
+def scatter_sphere_sampling(points, size=8, alpha=.5, figsize=(6, 4)):
+    """
+    Create scatter plot of 3D points in angular coordinates.
+
+    Parameters
+    ----------
+    points : ndarray of shape (n_samples, 3)
+        3D cartesian coordinates
+    """
+    theta, phi = cartesian_to_spherical(points)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    n_points = len(points)
+
+    ax.scatter(
+        np.degrees(phi),
+        # np.degrees(theta),
+        -np.cos(theta),
+        s=size,
+        alpha=alpha,
+        c='steelblue',
+        edgecolors='none',
+        rasterized=True
+    )
+
+    ax.set_xlabel('$\\varphi$')
+    ax.set_ylabel('$\\cos(\\theta)$')
+    ax.set_xlim(-180, 180)
+    # ax.set_ylim(0, 180)
+    ax.set_ylim(-1, 1)
+
+    plt.tight_layout()
+    return fig, ax
+
+
+def direction_homogeneity_metric(points, n_theta_bins=30, n_phi_bins=60):
+    """
+    Calculate homogeneity metric for directional sampling.
+
+    Returns
+    -------
+    float
+        Coefficient of variation (std/mean) of bin counts.
+        0 = perfectly homogeneous
+        Higher values = more inhomogeneous
+    """
+    theta, phi = cartesian_to_spherical(points)
+
+    theta_edges = np.arccos(np.linspace(1, -1, n_theta_bins + 1))
+    phi_edges = np.linspace(-np.pi, np.pi, n_phi_bins + 1)
+
+    histogram, _, _ = np.histogram2d(
+        theta, phi, bins=[theta_edges, phi_edges]
+    )
+
+    bin_counts = histogram.flatten()
+
+    return np.std(bin_counts) / np.mean(bin_counts)
+
+
+def direction_homogeneity_ratio(points, n_theta_bins=30, n_phi_bins=60,
+                                n_reference_samples=10):
+    """
+    Calculate homogeneity ratio compared to uniform random sampling.
+
+    Parameters
+    ----------
+    points : ndarray of shape (n_samples, 3)
+        3D cartesian coordinates
+    n_theta_bins : int
+        Number of bins for polar angle
+    n_phi_bins : int
+        Number of bins for azimuthal angle
+    n_reference_samples : int
+        Number of random samples to average over for reference
+
+    Returns
+    -------
+    float
+        Ratio of CV to reference CV.
+        1.0 = same as uniform random
+        < 1.0 = more homogeneous than random
+        > 1.0 = less homogeneous than random
+    """
+    n_samples = len(points)
+
+    cv_observed = direction_homogeneity_metric(
+        points, n_theta_bins, n_phi_bins
+    )
+
+    cv_reference_values = []
+    for _ in range(n_reference_samples):
+        random_dirs = np.random.randn(n_samples, 3)
+        random_dirs /= np.linalg.norm(random_dirs, axis=1, keepdims=True)
+        cv_ref = direction_homogeneity_metric(
+            random_dirs, n_theta_bins, n_phi_bins
+        )
+        cv_reference_values.append(cv_ref)
+
+    cv_reference = np.mean(cv_reference_values)
+
+    return cv_observed / cv_reference
+
+
+def affinity_entry_sum(X, epsilon, chunk=1000):
+    """sum_{i,j} exp(-||x_i-x_j||^2 / epsilon)"""
+    X = np.asarray(X)
+    n = X.shape[0]
+    total = 0.0
+    for i in range(0, n, chunk):
+        d2 = cdist(X[i:i+chunk], X, metric='sqeuclidean')
+        total += np.exp(-d2 / epsilon).sum()
+    return float(total)
+
+
+def plot_loglog_slope_analysis(sig_vals, sums):
+    # compute log-log slopes and find maximum
+    logx = np.log10(sig_vals)
+    logy = np.log10(sums)
+    slopes = np.diff(logy) / np.diff(logx)
+    imax = int(np.argmax(slopes))
+    slope_max = slopes[imax]
+    sig_at_max = np.sqrt(sig_vals[imax] * sig_vals[imax+1])
+    # line (in log space) anchored at midpoint
+    logx_mid = 0.5*(logx[imax]+logx[imax+1])
+    logy_mid = 0.5*(logy[imax]+logy[imax+1])
+    x_line_log = np.linspace(logx[0], logx[-1], 300)
+    y_line_log = slope_max*(x_line_log - logx_mid) + logy_mid
+
+    # plot
+    plt.figure(figsize=(4, 2.5))
+    plt.loglog(sig_vals, sums, '-o', markersize=4, label='entry sum')
+    plt.loglog(10**x_line_log, 10**y_line_log, '--',
+               linewidth=2, label='maximum slope')
+    plt.scatter([sig_at_max], [
+                10**(slope_max*(logx_mid-logx_mid)+logy_mid)], color='red', zorder=10)
+    plt.xlim(sig_vals[0], sig_vals[-1])
+    plt.xlabel('$\sigma$')
+    plt.ylabel('$\sum_{i,j} K_{i,j} N^{-2}$')
+    plt.grid(True, which='both', ls=':', alpha=0.5)
+    plt.text(
+        .95, 0.05,
+        rf'$\sigma^\ast \approx {sig_at_max:.3g}$' '\n'
+        rf'$d \approx {slope_max:.4f}$',
+        ha='right',
+        transform=plt.gca().transAxes,
+        bbox=dict(facecolor='white', alpha=1, edgecolor='none')
+    )
+    plt.legend(framealpha=1)
+    plt.tight_layout()
