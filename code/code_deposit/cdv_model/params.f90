@@ -12,8 +12,8 @@ module params
    !model timestepping params
    real(dp), parameter :: dt =2e-4_dp
    real(dp), parameter :: t_0=0._dp
-   real(dp), parameter :: t_f=200000._dp
-   real(dp), parameter :: sample_t =1._dp
+   real(dp), parameter :: t_f=20000._dp
+   real(dp), parameter :: sample_t =1e-2_dp
 
    !derived timestepping parameters, don't touch directly
    integer(kind=int64), parameter :: step_num=(t_f-t_0)/dt

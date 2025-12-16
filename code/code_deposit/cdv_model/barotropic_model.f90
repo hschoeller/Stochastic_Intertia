@@ -13,7 +13,7 @@ program barotropic_model
    implicit none
 
    ! Local variables
-   real(dp), dimension(dims)             :: init_con
+   ! real(dp), dimension(dims)             :: init_con
    real(dp), dimension(sample_num,dims) :: state_vector
    real(dp), dimension(sample_num,dims) :: ftle_hist
    real(dp), dimension(coeff_num)       :: coeff
@@ -31,13 +31,13 @@ program barotropic_model
 
    ! Seed random numbers and generate initial condition
    call time_seed()
-   init_con = generate_random_ic()
-   print *, 'Generated random IC:'
-   do i = 1, dims
-      print *, 'x(', i, ') = ', init_con(i)
-   end do
+   ! init_con = generate_random_ic()
+   ! print *, 'Generated random IC:'
+   ! do i = 1, dims
+   !    print *, 'x(', i, ') = ', init_con(i)
+   ! end do
 
-   Read program name and index argument
+   ! Read program name and index argument
    call get_command_argument(0, progname, len0)
    call get_command_argument(1, arg,     arglen)
    if (arglen <= 0) then
@@ -49,10 +49,15 @@ program barotropic_model
    ! Build filename based on g and index
    g100 = int(g * 100.0_dp + 0.5_dp)
    write(buf1, '(I0)') g100
-   write(buf2, '(I0)') idx
-   save_file      = 'dataOro' // trim(buf1) // '_' // trim(buf2) // '.bin'
-   save_file_ftle = 'ftle_'   // trim(buf1) // '_' // trim(buf2) // '.bin'
-   ! save_file      = 'dataOro20.bin'
+   ! write(buf2, '(I0)') idx
+   write(buf2, '(F12.8)') SUB_SIGMA
+   buf2 = adjustl(buf2)  ! remove leading space
+   do while (index(buf2, '.') > 0)
+      buf2(index(buf2, '.'):index(buf2, '.')) = 'p'
+   end do
+   save_file = 'datafine/dataOro' // trim(buf1) // '_sigma' // trim(buf2) // '.bin'
+   ! save_file      = 'dataOro' // trim(buf1) // '_' // trim(buf2) // '.bin'
+   save_file_ftle = 'datafine/ftle_'   // trim(buf1) // '_sigma' // trim(buf2) // '.bin'
    ! Generate coefficients and the linear operator
    call get_coeffs(b, beta, g, coeff)
    call build_lin_op(lin_op, coeff)
@@ -65,8 +70,8 @@ program barotropic_model
    write(10) state_vector
    close(10)
 
-   open(11, file=trim(save_file_ftle), access='stream', status='replace')
-   write(11) ftle_hist
-   close(11)
+   ! open(11, file=trim(save_file_ftle), access='stream', status='replace')
+   ! write(11) ftle_hist
+   ! close(11)
 
 end program barotropic_model

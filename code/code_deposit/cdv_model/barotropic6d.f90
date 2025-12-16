@@ -137,23 +137,23 @@ contains
          output(i+1,:)=x
 
          ! Compute eigenvalues of the Jacobian at current state
-         Jacob = build_jacobian(x)
+         ! Jacob = build_jacobian(x)
 
-         ! Compute eigenvalues using DGEEV
-         call dgeev('N', 'N', dims, Jacob, dims, wr, wi, vl, dims, vr, dims, work_eig, lwork_eig, info)
+         ! ! Compute eigenvalues using DGEEV
+         ! call dgeev('N', 'N', dims, Jacob, dims, wr, wi, vl, dims, vr, dims, work_eig, lwork_eig, info)
 
-         if (info /= 0) then
-            print *, 'Error in DGEEV eigenvalue calculation: info = ', info
-            print *, 'At iteration i = ', i
-            stop
-         end if
+         ! if (info /= 0) then
+         !    print *, 'Error in DGEEV eigenvalue calculation: info = ', info
+         !    print *, 'At iteration i = ', i
+         !    stop
+         ! end if
 
-         ! Convert to complex eigenvalues and store real parts in ftle_hist
-         do k=1,dims
-            eig_vals(k) = cmplx(wr(k), wi(k), kind=dp)
-            ftle_hist(i+1,k) = real(eig_vals(k))  ! Store real part of eigenvalue
-            ! ftle_hist(i+1,k) = sumlog(k) / ( (i*n_inner) * dt )
-         end do
+         ! ! Convert to complex eigenvalues and store real parts in ftle_hist
+         ! do k=1,dims
+         !    eig_vals(k) = cmplx(wr(k), wi(k), kind=dp)
+         !    ftle_hist(i+1,k) = real(eig_vals(k))  ! Store real part of eigenvalue
+         !    ! ftle_hist(i+1,k) = sumlog(k) / ( (i*n_inner) * dt )
+         ! end do
 
          print*,(100._dp*(i-1))/size(output,1), " percent complete"
       end do
