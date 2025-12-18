@@ -11,7 +11,7 @@
 # The following is for compiling and running different sigmas
 sigmas=($(python3 - <<'EOF'
 import numpy as np
-vals = np.linspace(0, 0.05, 101)
+vals = np.linspace(0, 0.03, 101)
 print(" ".join(map(str, vals)))
 EOF
 ))

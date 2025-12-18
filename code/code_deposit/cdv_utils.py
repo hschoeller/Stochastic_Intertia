@@ -965,7 +965,7 @@ def compute_clusters_from_TO(L, n_eig=12, n_clusters=2, n_init=10,
     }
 
 
-def classify_new_trajectory(X, labels, Y, k=10, threshold=0.5):
+def classify_new_trajectory(X, labels, Y, k=10, threshold=0.5, tree=None):
     """
     X: ndarray (n_samples, d)   -- original state space points
     labels: ndarray (n_samples,) -- cluster labels for X (e.g. from k-means)
@@ -976,7 +976,8 @@ def classify_new_trajectory(X, labels, Y, k=10, threshold=0.5):
     returns: ndarray (m_samples,) of regime labels for Y
              (-1 if no cluster passes threshold)
     """
-    tree = cKDTree(X)
+    if tree is None:
+        tree = cKDTree(X)
 
     # Query k nearest neighbors of each point in Y
     dists, idxs = tree.query(Y, k=k)
@@ -3679,3 +3680,141 @@ def plot_loglog_slope_analysis(sig_vals, sums):
     )
     plt.legend(framealpha=1)
     plt.tight_layout()
+
+
+def cdv(u, t):
+    params = [0.95, -0.76095, 0.1, 1.25, 0.2, 0.5]
+
+    x1, x2, x3, x4, x5, x6 = u
+    x1star, x4star, C, beta, gamma, b = params
+
+    def alpha_m(m, b):
+        return (8.*math.sqrt(2.)/math.pi)*(m*m/(4*m*m-1))*((b*b + m*m - 1)/(b*b+m*m))
+
+    def beta_m(m, b):
+        return beta*b*b/(b*b+m*m)
+
+    def gamma_m(m, b):
+        return gamma*(4*m*m*m/(4*m*m-1))*(math.sqrt(2)*b/(math.pi*(b*b + m*m)))
+
+    def gamma_m_tld(m, b):
+        return gamma*(4*m/(4*m*m-1))*(math.sqrt(2)*b/math.pi)
+
+    def delta(m, b):
+        return (64.*math.sqrt(2.)/(15.*math.pi))*((b*b - m*m+1)/(b*b+m*m))
+
+    # epsilon = 16.*math.sqrt(2)/(5*math.pi)
+    epsilon = 1.44050610585137
+
+    x1dot = gamma_m_tld(1, b)*x3 - C*(x1 - x1star)
+    x4dot = gamma_m_tld(2, b)*x6 - C*(x4 - x4star) + epsilon*(x2*x6 - x3*x5)
+
+    x2dot = -(alpha_m(1, b)*x1 - beta_m(1, b))*x3 - C*x2 - delta(1, b)*x4*x6
+    x5dot = -(alpha_m(2, b)*x1 - beta_m(2, b))*x6 - C*x5 - delta(2, b)*x4*x3
+
+    x3dot = (alpha_m(1, b)*x1 - beta_m(1, b))*x2 - \
+        gamma_m(1, b)*x1 - C*x3 + delta(1, b)*x4*x5
+    x6dot = (alpha_m(2, b)*x1 - beta_m(2, b))*x5 - \
+        gamma_m(2, b)*x4 - C*x6 + delta(2, b)*x4*x2
+
+    return np.array([x1dot, x2dot, x3dot, x4dot, x5dot, x6dot])
+
+
+def cdvjac(u, t):
+    params = [0.95, -0.76095, 0.1, 1.25, 0.2, 0.5]
+
+    x1, x2, x3, x4, x5, x6 = u
+    x1star, x4star, C, beta, gamma, b = params
+
+    def alpha_m(m, b):
+        return (8.*math.sqrt(2.)/math.pi)*(m*m/(4*m*m-1))*((b*b + m*m - 1)/(b*b+m*m))
+
+    def beta_m(m, b):
+        return beta*b*b/(b*b+m*m)
+
+    def gamma_m(m, b):
+        return gamma*(4*m*m*m/(4*m*m-1))*(math.sqrt(2)*b/(math.pi*(b*b + m*m)))
+
+    def gamma_m_tld(m, b):
+        return gamma*(4*m/(4*m*m-1))*(math.sqrt(2)*b/math.pi)
+
+    def delta(m, b):
+        return (64.*math.sqrt(2.)/(15.*math.pi))*((b*b - m*m+1)/(b*b+m*m))
+
+    # epsilon = 16.*math.sqrt(2)/(5*math.pi)
+    epsilon = 1.44050610585137
+
+    dx1dot = np.array([-C, 0., gamma_m_tld(1, b), 0., 0., 0.])
+    dx2dot = np.array([-alpha_m(1, b)*x3, -C, -alpha_m(1, b)
+                      * x1 + beta_m(1, b), -delta(1, b)*x6, 0., -delta(1, b)*x4])
+    dx3dot = np.array([alpha_m(1, b)*x2-gamma_m(1, b), alpha_m(1, b)
+                      * x1 - beta_m(1, b), -C, delta(1, b)*x5, delta(1, b)*x4, 0.])
+    dx4dot = np.array([0., epsilon*x6, -epsilon*x5, -C, -
+                      epsilon*x3, gamma_m_tld(2, b)+epsilon*x2])
+    dx5dot = np.array([-alpha_m(2, b)*x6, 0., -delta(2, b) *
+                      x4, -delta(2, b)*x3, -C, -alpha_m(2, b)*x1 + beta_m(2, b)])
+    dx6dot = np.array([alpha_m(2, b)*x5, delta(2, b)*x4, 0, -gamma_m(2,
+                      b) + delta(2, b)*x2, alpha_m(2, b)*x1 - beta_m(2, b), -C])
+
+    return np.array([dx1dot, dx2dot, dx3dot, dx4dot, dx5dot, dx6dot])
+
+
+def classify_new_trajectory_radius(X, labels, Y, l, r, not_l=-1, tree=None):
+    """
+    X: ndarray (n_samples, d)       -- original state space points
+    labels: ndarray (n_samples,)   -- labels for X
+    Y: ndarray (m_samples, d)       -- new trajectory to classify
+    l: int                          -- target label to check for
+    r: float                        -- radius for neighborhood search
+    not_l: int                      -- label assigned if l is not found
+
+    returns: ndarray (m_samples,)   -- labels for Y (pointwise)
+    """
+    if tree is None:
+        tree = cKDTree(X)
+    Y_labels = np.empty(len(Y), dtype=labels.dtype)
+
+    for i, y in enumerate(Y):
+        idxs = tree.query_ball_point(y, r)
+        if idxs and np.any(labels[idxs] == l):
+            Y_labels[i] = l
+        else:
+            Y_labels[i] = not_l
+
+    return Y_labels
+
+
+def find_nearby_indices(points: np.ndarray, labels_TO: np.ndarray, eps: float, regime: int) -> np.ndarray:
+    """
+    Return sorted unique indices of trajectory points that are:
+      - in regime 1 (labels_TO == 1), or
+      - one step after a regime-1 point,
+    and are within radius r of any of those seed points.
+
+    Assumes well-formed inputs: points.shape == (N, D), labels_TO.shape == (N,), labels in {0,1}.
+    """
+    points = np.asarray(points)
+    labels = np.asarray(labels_TO)
+    r = np.sqrt(eps)*3
+    N = points.shape[0]
+
+    idx_regime1 = np.nonzero(labels == regime)[0]
+    idx_after = (idx_regime1 + 1)[(idx_regime1 + 1) < N]
+    seed_idx = np.unique(np.concatenate(
+        [idx_regime1, idx_after])) if idx_regime1.size else np.array([], dtype=int)
+
+    if seed_idx.size == 0:
+        return np.array([], dtype=int)
+
+    tree = cKDTree(points)
+    neighbors_lists = tree.query_ball_point(points[seed_idx], r)
+
+    # Minimal, common-case flattening:
+    if seed_idx.size == 1:
+        # query_ball_point returns a single list of ints for a single query point
+        neighbors = np.asarray(neighbors_lists, dtype=int)
+    else:
+        # returns list-of-lists for multiple query points
+        neighbors = np.concatenate(neighbors_lists).astype(int)
+
+    return np.unique(neighbors)
