@@ -36,20 +36,7 @@ git clone https://github.com/hschoeller/Stochastic_Intertia.git
 Install dependencies:
 
 ```
-pip install -r requirements.txt
-```
-
----
-
-## Data
-
-* If data is included: describe it briefly here
-* If not included: explain how to obtain it
-
-Example:
-
-```
-bash scripts/download_data.sh
+conda env create -f env.yml
 ```
 
 ---
@@ -58,49 +45,37 @@ bash scripts/download_data.sh
 
 To reproduce the main results from the paper:
 
-```
-bash scripts/run_experiments.sh
-```
+The CdV trajectories can be calculated with an array of noise levels using the compandrun.sh script (on a slurm managed cluster or simply on your local machine with bash).
+All trajectories and referenced data can be calculated conveniently in jupyter notebooks:
 
-To generate figures:
-
-```
-python scripts/plot_results.py
-```
-
----
-
-## Results
-
-Expected outputs (e.g., metrics, plots) will be saved in:
-
-```
-results/
-```
+For chapter 3.1 Stochastic Inertia in a one-dimensional toy system use Toy.ipynb
+For chapter 3.2 A three-dimensional example without Stochastic Inertia use Toy3d.ipynb
+For chapter 3.3 Stochastic Inertia in the CdV system use PointwiseCdV.ipynb
 
 ---
 
 ## Citation
 
-If you use this code, please cite:
-
-```
-@article{your2026paper,
-  title={Full Paper Title},
-  author={Author, A. and Author, B.},
-  journal={Journal Name},
-  year={2026}
-}
-```
+If you use this code, please cite the upcomming publication.
 
 ---
 
 ## License
 
-Specify your license here (e.g., MIT, Apache 2.0).
+MIT License
+
+Copyright (c) 2026 [Henry Schoeller]
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY.
+
 
 ---
 
 ## Acknowledgments
 
-(Optional) Funding sources, collaborators, etc.
+This research has been funded by Deutsche Forschungsgemeinschaft (DFG) through grant CRC
+1114 "Scaling Cascades in Complex Systems", Project Number 235221301, Project A08 "Characterization and Prediction of Quasi-Stationary Atmospheric States"
