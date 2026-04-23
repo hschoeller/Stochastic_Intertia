@@ -2,16 +2,17 @@
 
 #SBATCH --job-name=CdV
 #SBATCH --partition=main
-#SBATCH --array=0-101
+#SBATCH --array=66-302
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --output=./logs/CdV_%a.out
 #SBATCH --error=./logs/CdV_%a.err
+#SBATCH --nodelist=calc04
 
 # The following is for compiling and running different sigmas
 sigmas=($(python3 - <<'EOF'
 import numpy as np
-vals = np.linspace(0, 0.03, 101)
+vals = np.arange(0, 0.03 + 1e-4, 1e-4)
 print(" ".join(map(str, vals)))
 EOF
 ))

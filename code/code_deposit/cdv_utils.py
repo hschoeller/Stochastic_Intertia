@@ -3818,3 +3818,108 @@ def find_nearby_indices(points: np.ndarray, labels_TO: np.ndarray, eps: float, r
         neighbors = np.concatenate(neighbors_lists).astype(int)
 
     return np.unique(neighbors)
+
+
+def plot_loglog_slope_analysis(sigmas_loglog, sums_all, sums_block):
+    from matplotlib.colors import to_rgba
+    from matplotlib.lines import Line2D
+
+    logx = np.log10(sigmas_loglog)
+    fig, ax = plt.subplots(figsize=(4, 2.5))
+    x_line_log = np.linspace(logx[0], logx[-1], 300)
+    table_rows = []
+    # plot datasets and slope-lines
+    for idx, (sums, lab, col, m) in enumerate(zip([sums_all, sums_block],
+                                                  ["All", "Blocking"],
+                                                  ['tab:blue', 'tab:orange'],
+                                                  ['x', '+'])):
+        sums = np.asarray(sums)
+        logy = np.log10(sums)
+
+        # local slopes between consecutive log points
+        slopes = np.diff(logy) / np.diff(logx)
+        imax = int(np.argmax(slopes))
+        slope_max = slopes[imax]
+
+        # geometric mean location for sigma* (between imax and imax+1)
+        sig_at_max = np.sqrt(sigmas_loglog[imax] * sigmas_loglog[imax + 1])
+
+        # anchor: midpoint in log space
+        logx_mid = 0.5 * (logx[imax] + logx[imax + 1])
+        logy_mid = 0.5 * (logy[imax] + logy[imax + 1])
+
+        # line (in log space) anchored at midpoint
+        y_line_log = slope_max * (x_line_log - logx_mid) + logy_mid
+
+        # main curve: log-log
+        ax.loglog(sigmas_loglog, sums, '-', color=col, marker=m,
+                  markersize=4, linewidth=1,
+                  label=lab, markevery=1)
+        ax.loglog(10 ** x_line_log, 10 ** y_line_log, '--', color=col,
+                  linewidth=1, alpha=1)
+
+        # point of maximum slope: same colour
+        y_at_max = 10 ** (slope_max * (logx_mid - logx_mid) +
+                          logy_mid)  # == 10**logy_mid
+        ax.scatter([sig_at_max], [y_at_max], color=col, edgecolor='k',
+                   s=(2*5), zorder=10)
+
+        # accumulate row for the summary table
+        table_rows.append((lab, f"{sig_at_max:.3g}", f"{slope_max:.4f}"))
+    ax.set_xlim(sigmas_loglog[0], sigmas_loglog[-1])
+    ax.set_xlabel(r'Noise Strength $\sigma$')
+    ax.set_ylabel(r'$\sum_{i,j} K_{i,j} N^{-2}$')
+    ax.grid(True, which='both', ls=':', alpha=0.5)
+
+    # Legend: ensure marker+colour shown exactly as plotted
+    legend_handles = []
+    for col, m, lab in zip(['tab:blue', 'tab:orange'],
+                           ['x', '+'],
+                           ["All", "Blocking"]
+                           ):
+        legend_handles.append(Line2D([0], [0], color=col, marker=m, lw=1,
+                                     markersize=4, label=lab))
+    ax.legend(handles=legend_handles, framealpha=1)
+
+    # Small table with results: place inside axes (upper left)
+    col_labels = ("", r"$\sigma^\ast$", r"$d$")
+    cell_text = [row for row in table_rows]
+
+    tbl = ax.table(
+        cellText=cell_text,
+        colLabels=col_labels,
+        cellLoc='center',
+        colLoc='center',
+        bbox=[0.45, 0.02, 0.53, 0.35],  # bottom-right corner
+        edges='closed',
+        colWidths=[0.4, 0.3, 0.3]
+    )
+
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(11)
+
+    tbl.set_zorder(10)
+
+    # Header: white and bold
+    for c in range(3):
+        cell = tbl[(0, c)]
+        cell.set_facecolor((1, 1, 1, 1))
+        cell.set_text_props(weight='bold')
+
+    # Data rows: tinted by dataset colour
+    for r, col in enumerate(['tab:blue', 'tab:orange'], start=1):
+        rgba = list(to_rgba(col))
+        rgba[3] = .5  # transparency
+
+        for c in range(3):
+            tbl[(r, c)].set_facecolor(rgba)
+    # Tidy up
+    plt.tight_layout()
+    return fig, ax
+
+
+def find_blocking_set(traj, labels):
+    mean_x1_label_0 = traj[labels == 0, 0].mean()
+    mean_x1_label_1 = traj[labels == 1, 0].mean()
+
+    return 1 if mean_x1_label_1 < mean_x1_label_0 else 0

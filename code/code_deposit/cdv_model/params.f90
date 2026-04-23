@@ -10,10 +10,10 @@ module params
    real(dp), parameter :: pi = 4._dp*ATAN(1._dp)
 
    !model timestepping params
-   real(dp), parameter :: dt =2e-4_dp
+   real(dp), parameter :: dt =1e-5_dp
    real(dp), parameter :: t_0=0._dp
-   real(dp), parameter :: t_f=20000._dp
-   real(dp), parameter :: sample_t =1e-2_dp
+   real(dp), parameter :: t_f=2000000._dp
+   real(dp), parameter :: sample_t =1._dp
 
    !derived timestepping parameters, don't touch directly
    integer(kind=int64), parameter :: step_num=(t_f-t_0)/dt

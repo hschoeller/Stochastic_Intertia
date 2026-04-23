@@ -55,7 +55,7 @@ program barotropic_model
    do while (index(buf2, '.') > 0)
       buf2(index(buf2, '.'):index(buf2, '.')) = 'p'
    end do
-   save_file = 'datafine/dataOro' // trim(buf1) // '_sigma' // trim(buf2) // '.bin'
+   save_file = 'data/dataOro' // trim(buf1) // '_sigma' // trim(buf2) // '.bin'
    ! save_file      = 'dataOro' // trim(buf1) // '_' // trim(buf2) // '.bin'
    save_file_ftle = 'datafine/ftle_'   // trim(buf1) // '_sigma' // trim(buf2) // '.bin'
    ! Generate coefficients and the linear operator
