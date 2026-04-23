@@ -1,9 +1,12 @@
 # Stochastic Inertia
 
 Code repository for the paper:
+
 **"Noise-induced enhancement of regime lifetimes -- A data-driven approach using deterministic trajectories"**
+
 by Henry Schoeller, Robin Chemnitz, P´eter Koltai, Maximilian Engel,
 and Stephan Pfahl
+
 (*Communications in Applied Mathematics and Computational Sciences, 2026*)
 
 ---
@@ -30,7 +33,7 @@ This repository contains the code and resources needed to reproduce the main res
 Clone the repository:
 
 ```
-git clone https://github.com/hschoeller/Stochastic_Intertia.git
+git clone https://github.com/hschoeller/Stochastic_Inertia.git
 ```
 
 Install dependencies:
@@ -45,12 +48,12 @@ conda env create -f env.yml
 
 To reproduce the main results from the paper:
 
-The CdV trajectories can be calculated with an array of noise levels using the compandrun.sh script (on a slurm managed cluster or simply on your local machine with bash).
+The CdV trajectories can be calculated with an array of noise levels using the *compandrun.sh* script (on a slurm managed cluster or simply on your local machine with bash).
 All trajectories and referenced data can be calculated conveniently in jupyter notebooks:
 
-For chapter 3.1 Stochastic Inertia in a one-dimensional toy system use Toy.ipynb
-For chapter 3.2 A three-dimensional example without Stochastic Inertia use Toy3d.ipynb
-For chapter 3.3 Stochastic Inertia in the CdV system use PointwiseCdV.ipynb
+- For chapter 3.1 Stochastic Inertia in a one-dimensional toy system use Toy.ipynb
+- For chapter 3.2 A three-dimensional example without Stochastic Inertia use Toy3d.ipynb
+- For chapter 3.3 Stochastic Inertia in the CdV system use PointwiseCdV.ipynb
 
 ---
 
