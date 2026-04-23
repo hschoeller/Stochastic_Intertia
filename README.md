@@ -1,5 +1,5 @@
 # Stochastic Inertia
-
+https://doi.org/10.5281/zenodo.19711549
 Code repository for the paper:
 
 **"Noise-induced enhancement of regime lifetimes -- A data-driven approach using deterministic trajectories"**
